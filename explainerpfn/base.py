@@ -1,7 +1,9 @@
 import typing
-from typing import Any, Literal
-from typing_extensions import TypeAlias
+from typing import Any, Literal, Union
+from typing_extensions import TypeAlias, TypedDict
 from collections.abc import Sequence
+from pathlib import Path
+from functools import partial
 
 import numpy as np
 import torch
@@ -11,7 +13,7 @@ from sklearn.base import TransformerMixin, check_is_fitted
 from sklearn.pipeline import Pipeline
 
 # from tabpfn import TabPFNRegressor
-from tabpfn.base import initialize_tabpfn_model, check_cpu_warning, determine_precision
+from tabpfn.base import check_cpu_warning, determine_precision
 from tabpfn.preprocessing import (
     RegressorEnsembleConfig,
     ReshapeFeatureDistributionsStep,
@@ -31,11 +33,183 @@ from tabpfn.utils import (
     _transform_borders_one,
 )
 from tabpfn.config import ModelInterfaceConfig
+
 from explainerpfn.inference import InferenceEngineCachePreprocessing
+from explainerpfn.model_loading import load_model_criterion_config
 
 XType: TypeAlias = Any
 SampleWeightType: TypeAlias = Any
 YType: TypeAlias = Any
+# TODO: Define ArchitectureConfig
+ArchitectureConfig: TypeAlias = (
+    Any  # Placeholder for the actual architecture config type
+)
+
+
+class MainOutputDict(TypedDict):
+    """Dictionary containing the main output types from the TabPFN regressor."""
+
+    mean: np.ndarray
+    median: np.ndarray
+    mode: np.ndarray
+    quantiles: list[np.ndarray]
+
+
+class FullOutputDict(MainOutputDict):
+    """Dictionary containing all outputs from the TabPFN regressor."""
+
+    criterion: FullSupportBarDistribution
+    logits: torch.Tensor
+
+
+class BaseModelSpecs:
+    """Base class for model specifications."""
+
+    def __init__(self, model: torch.nn.Module, config: ArchitectureConfig):
+        self.model = model
+        self.config = config
+
+
+class RegressorModelSpecs(BaseModelSpecs):
+    """Model specs for regressors."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        config: ArchitectureConfig,
+        norm_criterion: FullSupportBarDistribution,
+    ):
+        super().__init__(model, config)
+        self.norm_criterion = norm_criterion
+
+
+def initialize_explainerpfn_model(
+    model_path: Union[str, Path, Literal["auto"], RegressorModelSpecs],
+    fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache"],
+) -> RegressorModelSpecs:
+    """Initializes a TabPFN model based on the provided configuration.
+
+    Args:
+        model_path: Path or directive ("auto") to load the pre-trained model from.
+        which: Which TabPFN model to load.
+        fit_mode: Determines caching behavior.
+
+    Returns:
+        model: The loaded TabPFN model.
+        config: The configuration object associated with the loaded model.
+        bar_distribution: The BarDistribution for regression (`None` if classifier).
+    """
+    model, config, norm_criterion = None, None, None
+    if isinstance(model_path, RegressorModelSpecs):
+        model = model_path.model
+        config = model_path.config
+        norm_criterion = model_path.norm_criterion
+    elif model_path is None or isinstance(model_path, (str, Path)):
+        # (after processing 'auto')
+        download = True
+        if isinstance(model_path, str) and model_path == "auto":
+            model_path = None  # type: ignore
+
+        # Load model with potential caching
+        # The regressor's bar distribution is required
+        model, bardist, config = load_model_criterion_config(
+            model_path=model_path,  # type: ignore
+            check_bar_distribution_criterion=True,
+            cache_trainset_representation=(fit_mode == "fit_with_cache"),
+            which="regressor",
+            version="v2",
+            download=download,
+        )
+        norm_criterion = bardist
+
+    return model, config, norm_criterion
+
+
+def _logits_to_output(
+    *,
+    output_type: str,
+    logits: torch.Tensor,
+    criterion: FullSupportBarDistribution,
+    quantiles: list[float],
+) -> np.ndarray | list[np.ndarray]:
+    """Convert the logits to the specified output type.
+
+    Args:
+        output_type: The output type to convert the logits to.
+        logits: The logits to convert.
+        criterion: The criterion to use for the conversion.
+        quantiles: The quantiles to use for the conversion.
+
+    Returns:
+        The converted logits or list of converted logits.
+    """
+    if output_type == "quantiles":
+        return [criterion.icdf(logits, q).cpu().detach().numpy() for q in quantiles]
+
+    # TODO: support
+    #   "pi": criterion.pi(logits, np.max(self.y)),
+    #   "ei": criterion.ei(logits),
+    if output_type == "mean":
+        output = criterion.mean(logits)
+    elif output_type == "median":
+        output = criterion.median(logits)
+    elif output_type == "mode":
+        output = criterion.mode(logits)
+    else:
+        raise ValueError(f"Invalid output type: {output_type}")
+
+    return output.cpu().detach().numpy()  # type: ignore
+
+
+def _map_to_bucket_ix(y: torch.Tensor, borders: torch.Tensor) -> torch.Tensor:
+    ix = torch.searchsorted(sorted_sequence=borders, input=y) - 1
+    ix[y == borders[0]] = 0
+    ix[y == borders[-1]] = len(borders) - 2
+    return ix
+
+
+def _cdf(logits: torch.Tensor, borders: torch.Tensor, ys: torch.Tensor) -> torch.Tensor:
+    ys = ys.repeat(logits.shape[:-1] + (1,))
+    n_bars = len(borders) - 1
+    y_buckets = _map_to_bucket_ix(ys, borders).clamp(0, n_bars - 1).to(logits.device)
+
+    probs = torch.softmax(logits, dim=-1)
+    prob_so_far = torch.cumsum(probs, dim=-1) - probs
+    prob_left_of_bucket = prob_so_far.gather(index=y_buckets, dim=-1)
+
+    bucket_widths = borders[1:] - borders[:-1]
+    share_of_bucket_left = (ys - borders[y_buckets]) / bucket_widths[y_buckets]
+    share_of_bucket_left = share_of_bucket_left.clamp(0.0, 1.0)
+
+    prob_in_bucket = probs.gather(index=y_buckets, dim=-1) * share_of_bucket_left
+    prob_left_of_ys = prob_left_of_bucket + prob_in_bucket
+
+    prob_left_of_ys[ys <= borders[0]] = 0.0
+    prob_left_of_ys[ys >= borders[-1]] = 1.0
+    return prob_left_of_ys.clip(0.0, 1.0)
+
+
+def translate_probs_across_borders(
+    logits: torch.Tensor,
+    *,
+    frm: torch.Tensor,
+    to: torch.Tensor,
+) -> torch.Tensor:
+    """Translate the probabilities across the borders.
+
+    Args:
+        logits: The logits defining the distribution to translate.
+        frm: The borders to translate from.
+        to: The borders to translate to.
+
+    Returns:
+        The translated probabilities.
+    """
+    prob_left = _cdf(logits, borders=frm, ys=to)
+    prob_left[..., 0] = 0.0
+    prob_left[..., -1] = 1.0
+
+    return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
 
 
 class ExplainerPFN:  # (TabPFNRegressor):
@@ -171,10 +345,9 @@ class ExplainerPFN:  # (TabPFNRegressor):
             else rng.integers(0, 2**31 - 1)
         )
 
-        self.model_, self.config_, self.bardist_ = initialize_tabpfn_model(
+        self.model_, self.config_, self.bardist_ = initialize_explainerpfn_model(
             model_path=self.model_path,
-            which="regressor",
-            fit_mode="batched",
+            fit_mode="fit_with_cache",
         )
 
         # Get the device type and ensure it's a valid torch device
@@ -356,7 +529,21 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # TODO: Modify borders definition
         return averaged_logits, outputs, borders
 
-    def _get_feature_contributions(self, X, y, feature_idx):
+    def predict_feature(
+        self,
+        X,
+        y,
+        feature_idx,
+        output_type: Literal[
+            "mean",
+            "median",
+            "mode",
+            "quantiles",
+            "full",
+            "main",
+        ] = "mean",
+        quantiles: list[float] | None = None,
+    ):
         """
         Get the contributions of a specific feature.
 
@@ -374,6 +561,79 @@ class ExplainerPFN:  # (TabPFNRegressor):
         contributions : array-like, shape (n_samples,)
             Contributions of the specified feature.
         """
-        output = self.forward(X, y, feature_idx, only_return_standard_out=True)
+        check_is_fitted(self)
 
+        # TODO: Check what quantiles are for
+        if quantiles is None:
+            quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+        # Forward pass
+        (
+            _,  # averaged logits (not used here)
+            outputs,  # list of tensors [N_est, N_samples, N_borders] (after forward)
+            borders,  # list of numpy arrays containing borders for each estimator
+        ) = self.forward(X, y, feature_idx, only_return_standard_out=True)
+
+        # Process outputs into probabilities, expected value and get final logits
+        transformed_logits = [
+            translate_probs_across_borders(
+                logits,
+                frm=torch.as_tensor(borders_t, device=self.device_),
+                to=self.bardist_.borders.to(self.device_),
+            )
+            for logits, borders_t in zip(outputs, borders)
+        ]
+        stacked_logits = torch.stack(transformed_logits, dim=0)
+        logits = stacked_logits.mean(dim=0)
+
+        # Post-process the logits
+        logits = logits.log()
+        if logits.dtype == torch.float16:
+            logits = logits.float()
+        logits = logits.cpu()
+
+        # Determine and return intended output type
+        logit_to_output = partial(
+            _logits_to_output,
+            logits=logits,
+            criterion=self.normalized_bardist_,
+            quantiles=quantiles,
+        )
+        if output_type in ["full", "main"]:
+            # Create a dictionary of outputs with proper typing via TypedDict
+            # Get individual outputs with proper typing
+            mean_out = typing.cast("np.ndarray", logit_to_output(output_type="mean"))
+            median_out = typing.cast(
+                "np.ndarray", logit_to_output(output_type="median")
+            )
+            mode_out = typing.cast("np.ndarray", logit_to_output(output_type="mode"))
+            quantiles_out = typing.cast(
+                "list[np.ndarray]",
+                logit_to_output(output_type="quantiles"),
+            )
+
+            # Create our typed dictionary
+            main_outputs = MainOutputDict(
+                mean=mean_out,
+                median=median_out,
+                mode=mode_out,
+                quantiles=quantiles_out,
+            )
+
+            if output_type == "full":
+                # Return full output with criterion and logits
+                return FullOutputDict(
+                    **main_outputs,
+                    criterion=self.normalized_bardist_,
+                    logits=logits,
+                )
+
+            return main_outputs
+
+        return logit_to_output(output_type=output_type)
+
+    def get_embeddings(self, X, y, feature_idx):
+        output = self.forward(X, y, feature_idx, only_return_standard_out=True)[
+            "test_embeddings"
+        ]
         return output

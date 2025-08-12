@@ -185,7 +185,9 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
                     y_full,
                     only_return_standard_out=only_return_standard_out,
                     categorical_inds=batched_cat_ix,
-                    single_eval_pos=len(y_full),  # TODO: check if this is correct
+                    single_eval_pos=len(
+                        y_train
+                    ),  # len(y_full),  # TODO: check if this is correct
                 )
 
             output = output if isinstance(output, dict) else output.squeeze(1)
