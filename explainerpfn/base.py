@@ -14,12 +14,12 @@ from sklearn.pipeline import Pipeline
 
 # from tabpfn import TabPFNRegressor
 from tabpfn.base import check_cpu_warning, determine_precision
-from tabpfn.preprocessing import (
-    RegressorEnsembleConfig,
+from explainerpfn.preprocessing import (
+    ExplainerEnsembleConfig,
     ReshapeFeatureDistributionsStep,
     EnsembleConfig,
     PreprocessorConfig,
-    default_regressor_preprocessor_configs,
+    default_explanation_preprocessor_configs,
 )
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
 from tabpfn.utils import (
@@ -36,6 +36,7 @@ from tabpfn.config import ModelInterfaceConfig
 
 from explainerpfn.inference import InferenceEngineCachePreprocessing
 from explainerpfn.model_loading import load_model_criterion_config
+from explainerpfn.utils import prepare_explanation_dataset
 
 XType: TypeAlias = Any
 SampleWeightType: TypeAlias = Any
@@ -146,9 +147,6 @@ def _logits_to_output(
     if output_type == "quantiles":
         return [criterion.icdf(logits, q).cpu().detach().numpy() for q in quantiles]
 
-    # TODO: support
-    #   "pi": criterion.pi(logits, np.max(self.y)),
-    #   "ei": criterion.ei(logits),
     if output_type == "mean":
         output = criterion.mean(logits)
     elif output_type == "median":
@@ -212,7 +210,7 @@ def translate_probs_across_borders(
     return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
 
 
-class ExplainerPFN:  # (TabPFNRegressor):
+class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
     """
     A class to handle the SHAP values for a PFN model.
 
@@ -224,6 +222,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
     def __init__(
         self,
+        feature_idx: int = 0,
         n_estimators: int = 1,
         categorical_features_indices: Sequence[int] | None = None,
         softmax_temperature=0.9,
@@ -234,6 +233,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         random_state=None,
         n_jobs: int = -1,
     ):
+        self.feature_idx = feature_idx
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
         self.softmax_temperature = softmax_temperature
@@ -245,11 +245,16 @@ class ExplainerPFN:  # (TabPFNRegressor):
         self.n_jobs = n_jobs
 
     def _initialize_dataset_preprocessing(
-        self, X: XType, y: YType, rng: np.random.Generator
-    ) -> tuple[list[RegressorEnsembleConfig], XType, YType, FullSupportBarDistribution]:
+        self, X: XType, y: YType, feature_idx: int, rng: np.random.Generator
+    ) -> tuple[list[ExplainerEnsembleConfig], XType, YType, FullSupportBarDistribution]:
         """
         NOTE: This will need to be entirely rewritten.
         """
+        X, y = prepare_explanation_dataset(
+            X=X,
+            y=y,
+            feature_idx=feature_idx,
+        )
 
         X, y, feature_names_in, n_features_in = validate_Xy_fit(
             X,
@@ -306,10 +311,11 @@ class ExplainerPFN:  # (TabPFNRegressor):
             else:
                 preprocessor = None
             target_preprocessors.append(preprocessor)
-        preprocess_transforms = self.interface_config_.PREPROCESS_TRANSFORMS
+
+        # preprocess_transforms = self.interface_config_.PREPROCESS_TRANSFORMS
 
         # TODO: NEEDS TO BE MODIFIED TO PRESERVE THE ORDER OF CERTAIN FEATURES
-        ensemble_configs = EnsembleConfig.generate_for_regression(
+        ensemble_configs = EnsembleConfig.generate_for_explainability(
             n=self.n_estimators,  # refers to the number of estimators
             subsample_size=self.interface_config_.SUBSAMPLE_SAMPLES,
             add_fingerprint_feature=self.interface_config_.FINGERPRINT_FEATURE,
@@ -318,11 +324,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
             max_index=len(X),
             preprocessor_configs=typing.cast(
                 "Sequence[PreprocessorConfig]",
-                (
-                    preprocess_transforms
-                    if preprocess_transforms is not None
-                    else default_regressor_preprocessor_configs()
-                ),
+                default_explanation_preprocessor_configs(),
             ),
             target_transforms=target_preprocessors,
             random_state=rng,
@@ -411,7 +413,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """
         byte_size, rng = self._initialize_model_variables()
         ensemble_configs, X, y, self.bardist_ = self._initialize_dataset_preprocessing(
-            X, y, rng
+            X, y, self.feature_idx, rng
         )
 
         self.X_ = X
@@ -455,6 +457,12 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """
         check_is_fitted(self)
 
+        X, y = prepare_explanation_dataset(
+            X=X,
+            y=y,
+            feature_idx=feature_idx,
+        )
+
         std_borders = self.bardist_.borders.cpu().numpy()
         outputs: list[torch.Tensor] = []
         borders: list[np.ndarray] = []
@@ -482,7 +490,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
                 single_config = config[0]
                 config_for_ensemble = single_config
 
-            if isinstance(config_for_ensemble, RegressorEnsembleConfig):
+            if isinstance(config_for_ensemble, ExplainerEnsembleConfig):
                 borders_t: np.ndarray
                 logit_cancel_mask: np.ndarray | None
                 descending_borders: bool
@@ -529,11 +537,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # TODO: Modify borders definition
         return averaged_logits, outputs, borders
 
-    def predict_feature(
+    def predict(
         self,
         X,
         y,
-        feature_idx,
         output_type: Literal[
             "mean",
             "median",
@@ -572,7 +579,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
             _,  # averaged logits (not used here)
             outputs,  # list of tensors [N_est, N_samples, N_borders] (after forward)
             borders,  # list of numpy arrays containing borders for each estimator
-        ) = self.forward(X, y, feature_idx, only_return_standard_out=True)
+        ) = self.forward(X, y, self.feature_idx, only_return_standard_out=True)
 
         # Process outputs into probabilities, expected value and get final logits
         transformed_logits = [
@@ -632,8 +639,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
         return logit_to_output(output_type=output_type)
 
-    def get_embeddings(self, X, y, feature_idx):
-        output = self.forward(X, y, feature_idx, only_return_standard_out=True)[
+    def get_embeddings(self, X, y):
+        output = self.forward(X, y, self.feature_idx, only_return_standard_out=True)[
             "test_embeddings"
         ]
         return output

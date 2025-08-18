@@ -18,7 +18,6 @@ from torch.utils.checkpoint import checkpoint
 
 from explainerpfn.model.encoders import (
     LinearInputEncoderStep,
-    NanHandlingEncoderStep,
     SequentialEncoder,
 )
 from tabpfn.model.layer import PerFeatureEncoderLayer

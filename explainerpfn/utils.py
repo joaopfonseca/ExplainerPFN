@@ -1,39 +1,36 @@
-from mlresearch.datasets import ContinuousCategoricalDatasets
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestClassifier
+import numpy as np
 
 
-def get_toy_data():
+def prepare_explanation_dataset(
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_idx: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Get toy data for testing purposes.
+    Prepares a dataset for explanation by concatenating the target variable and features,
+    and selecting a specific feature column as the explanation target. The target variable
+    is added as the first column of the feature matrix.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix of shape (n_samples, n_features).
+    y : np.ndarray
+        Target vector of shape (n_samples,).
+    feature_idx : int
+        Index of the feature to be selected from `X`.
+
+    Returns
+    -------
+    X_concat : np.ndarray
+        Concatenated array of shape (n_samples, n_features + 1), where the first column is `y`
+        and the remaining columns are the features from `X`.
+    target_feature : np.ndarray
+        Array of shape (n_samples,) containing the values of the selected feature column from `X`.
     """
-    datasets = ContinuousCategoricalDatasets(names=["GERMAN CREDIT"]).download()
-    df = datasets[0][-1]
-    continuous_columns = df.columns.drop("target").str.startswith("cat_")
-    X, y = df.drop(columns=["target"]), df["target"]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.5, random_state=42
-    )
-    return X_train, X_test, y_train, y_test, continuous_columns
-
-
-def get_ml_pipeline(X_train, y_train, continuous_columns):
-    """
-    Get a machine learning pipeline for testing purposes.
-    """
-
-    clf = make_pipeline(
-        ColumnTransformer(
-            transformers=[
-                ("cat", OneHotEncoder(), continuous_columns),
-                ("num", "passthrough", ~continuous_columns),
-            ]
-        ),
-        RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1),
-    )
-
-    clf.fit(X_train, y_train)
-    return clf
+    target_feature = X[:, feature_idx].copy()
+    X_ = np.delete(X, feature_idx, axis=1)  # Remove the selected feature from X
+    X_concat = np.concatenate(
+        [y.reshape(-1, 1), X_], axis=1
+    )  # Add the original target feature as the first column
+    return X_concat, target_feature

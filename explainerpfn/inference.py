@@ -13,7 +13,7 @@ import torch
 
 from tabpfn.model.memory import MemoryUsageEstimator
 from tabpfn.inference import InferenceEngine
-from tabpfn.preprocessing import (
+from explainerpfn.preprocessing import (
     SequentialFeatureTransformer,
     EnsembleConfig,
     fit_preprocessing,
