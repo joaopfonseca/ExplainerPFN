@@ -4,6 +4,7 @@ from typing_extensions import TypeAlias, TypedDict
 from collections.abc import Sequence
 from pathlib import Path
 from functools import partial
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -644,3 +645,49 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
             "test_embeddings"
         ]
         return output
+
+    def save_foundation_model(self, path: Union[str, Path]):
+        """
+        Save the underlying model to the specified path.
+
+        This writes only the base pre-trained weights and configuration. It does
+        **not** store a fitted :class:`TabPFNRegressor`/``Classifier`` instance.
+        The resulting file is merely a checkpoint consumed by
+        :func:`load_model_criterion_config` to build a new estimator.
+
+        Args:
+            model:
+                The internal model object of a ``TabPFN`` estimator.
+            save_path:
+                Path to save the checkpoint to.
+        """
+        # Clear trainset representation cache if it exists
+        self.model_.empty_trainset_representation_cache()
+
+        # Get model state dict
+        model_state = self.model_.state_dict()
+
+        # Get bardist state dict and prefix with 'criterion.'
+        if hasattr(self.model_, "bardist_") and self.model_.bardist_ is not None:
+            bardist_state = {
+                f"criterion.{k}": v
+                for k, v in self.model_.bardist_.state_dict().items()
+            }
+            # Combine model and bardist states
+            state_dict = {**model_state, **bardist_state}
+        elif hasattr(self, "bardist_") and self.bardist_ is not None:
+            bardist_state = {
+                f"criterion.{k}": v for k, v in self.bardist_.state_dict().items()
+            }
+            # Combine model and bardist states
+            state_dict = {**model_state, **bardist_state}
+        else:
+            state_dict = model_state
+
+        # Create checkpoint with correct structure
+        checkpoint = {"state_dict": state_dict, "config": asdict(self.config_)}
+
+        # Save the checkpoint
+        torch.save(checkpoint, path)
+
+        return self

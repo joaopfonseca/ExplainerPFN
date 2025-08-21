@@ -10,7 +10,7 @@ import torch
 from pathlib import Path
 
 # from urllib.error import URLError
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from typing_extensions import TypeAlias
 from torch import nn
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
@@ -49,9 +49,10 @@ def load_model(
     # files that contain non-tensor data.  This `weights_only=None` is the
     # default value. In the future this will default to `True`, dissallowing
     # loading of arbitrary objects.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=FutureWarning)
-        checkpoint = torch.load(path, map_location="cpu", weights_only=None)
+    # with warnings.catch_warnings():
+    #     warnings.simplefilter("ignore", category=FutureWarning)
+    #     checkpoint = torch.load(path, map_location="cpu", weights_only=None)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=None)
 
     state_dict = checkpoint["state_dict"]
     config, unused_config = parse_config(checkpoint["config"])
@@ -79,6 +80,7 @@ def load_model(
     model.load_state_dict(state_dict)
     model.eval()
 
+    print("Model loaded successfully.", path)
     return model, loss_criterion, config
 
 
@@ -140,6 +142,7 @@ def load_model_criterion_config(
                 f"Then place it at: {model_path}",
             ) from res[0]
 
+    print("load_model_criterion_config", model_path)
     loaded_model, criterion, config = load_model(path=model_path)
     loaded_model.cache_trainset_representation = cache_trainset_representation
     if check_bar_distribution_criterion and not isinstance(
