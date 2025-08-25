@@ -20,6 +20,8 @@ from explainerpfn.preprocessing import (
 )
 from tabpfn.utils import get_autocast_context
 
+from explainerpfn.utils import prepare_explanation_dataset
+
 
 @dataclass
 class InferenceEngineCachePreprocessing(InferenceEngine):
@@ -109,11 +111,74 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             no_preprocessing=no_preprocessing,
         )
 
+    def prepare_inference_data(
+        self,
+        preprocessor: SequentialFeatureTransformer,
+        X_train: np.ndarray | torch.Tensor,
+        y_train: np.ndarray | torch.Tensor,
+        X: np.ndarray | torch.Tensor,
+        y: np.ndarray | torch.Tensor,
+        feature_idx: int,
+        config: EnsembleConfig,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare the inference data for by transforming the training and test data.
+        """
+        X_train, y_train = prepare_explanation_dataset(
+            X=X_train,
+            y=y_train,
+            feature_idx=feature_idx,
+        )
+        X, y = prepare_explanation_dataset(
+            X=X,
+            y=y,
+            feature_idx=feature_idx,
+        )
+
+        if not isinstance(X_train, torch.Tensor):
+            X_train = torch.as_tensor(X_train, dtype=torch.float32)  # noqa: PLW2901
+        X_train = X_train.to(device)  # noqa: PLW2901
+
+        X_test = preprocessor.transform(X).X if not self.no_preprocessing else X
+        if not isinstance(X_test, torch.Tensor):
+            X_test = torch.as_tensor(X_test, dtype=torch.float32)
+        X_test = X_test.to(device)
+        X_full = torch.cat([X_train, X_test], dim=0).unsqueeze(1)
+
+        if not isinstance(y_train, torch.Tensor):
+            y_train = torch.as_tensor(y_train, dtype=torch.float32)  # noqa: PLW2901
+        y_train = y_train.to(device)  # noqa: PLW2901
+
+        y_test = (
+            config.target_transform.transform(
+                y.reshape(-1, 1),
+            ).ravel()
+            if config.target_transform is not None
+            else y
+        )
+        if not isinstance(y_test, torch.Tensor):
+            y_test = torch.as_tensor(y_test, dtype=torch.float32)  # noqa: PLW2901
+        y_test = y_test.to(device)  # noqa: PLW2901
+        y_full = torch.cat([y_train, y_test], dim=0).unsqueeze(1)
+
+        # batched_cat_ix = [cat_ix]
+
+        # Handle type casting
+        with contextlib.suppress(Exception):  # Avoid overflow error
+            X_full = X_full.float()
+        if self.force_inference_dtype is not None:
+            X_full = X_full.type(self.force_inference_dtype)
+            y_full = y_train.type(self.force_inference_dtype)  # type: ignore # noqa: PLW2901
+
+        return X_full, y_full
+
     @override
     def iter_outputs(
         self,
         X: np.ndarray | torch.Tensor,
         y: np.ndarray | torch.Tensor,
+        feature_idx: int,
         *,
         device: torch.device,
         autocast: bool,
@@ -129,41 +194,19 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             self.ensemble_configs,
             self.cat_ixs,
         ):
-            # TODO: ensure feature_idx is at the first index
-            if not isinstance(X_train, torch.Tensor):
-                X_train = torch.as_tensor(X_train, dtype=torch.float32)  # noqa: PLW2901
-            X_train = X_train.to(device)  # noqa: PLW2901
 
-            X_test = preprocessor.transform(X).X if not self.no_preprocessing else X
-            if not isinstance(X_test, torch.Tensor):
-                X_test = torch.as_tensor(X_test, dtype=torch.float32)
-            X_test = X_test.to(device)
-            X_full = torch.cat([X_train, X_test], dim=0).unsqueeze(1)
-
-            if not isinstance(y_train, torch.Tensor):
-                y_train = torch.as_tensor(y_train, dtype=torch.float32)  # noqa: PLW2901
-            y_train = y_train.to(device)  # noqa: PLW2901
-
-            y_test = (
-                config.target_transform.transform(
-                    y.reshape(-1, 1),
-                ).ravel()
-                if config.target_transform is not None
-                else y
+            # NOTE: This chunk was moved to its own method
+            # to facilitate model training
+            X_full, y_full = self.prepare_inference_data(
+                preprocessor=preprocessor,
+                X_train=X_train,
+                y_train=y_train,
+                X=X,
+                y=y,
+                feature_idx=feature_idx,
+                config=config,
+                device=device,
             )
-            if not isinstance(y_test, torch.Tensor):
-                y_test = torch.as_tensor(y_test, dtype=torch.float32)  # noqa: PLW2901
-            y_test = y_test.to(device)  # noqa: PLW2901
-            y_full = torch.cat([y_train, y_test], dim=0).unsqueeze(1)
-
-            batched_cat_ix = [cat_ix]
-
-            # Handle type casting
-            with contextlib.suppress(Exception):  # Avoid overflow error
-                X_full = X_full.float()
-            if self.force_inference_dtype is not None:
-                X_full = X_full.type(self.force_inference_dtype)
-                y_full = y_train.type(self.force_inference_dtype)  # type: ignore # noqa: PLW2901
 
             if self.inference_mode:
                 MemoryUsageEstimator.reset_peak_memory_if_required(
@@ -184,7 +227,7 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
                     X_full,
                     y_full,
                     only_return_standard_out=only_return_standard_out,
-                    categorical_inds=batched_cat_ix,
+                    categorical_inds=[cat_ix],
                     single_eval_pos=len(
                         y_train
                     ),  # len(y_full),  # TODO: check if this is correct

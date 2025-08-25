@@ -1,3 +1,7 @@
+"""
+TODO: Test removing any std or mean corrections to the predicted values (!!!)
+"""
+
 import typing
 from typing import Any, Literal, Union
 from typing_extensions import TypeAlias, TypedDict
@@ -246,17 +250,11 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         self.n_jobs = n_jobs
 
     def _initialize_dataset_preprocessing(
-        self, X: XType, y: YType, feature_idx: int, rng: np.random.Generator
+        self, X: XType, y: YType, rng: np.random.Generator
     ) -> tuple[list[ExplainerEnsembleConfig], XType, YType, FullSupportBarDistribution]:
         """
         NOTE: This will need to be entirely rewritten.
         """
-        X, y = prepare_explanation_dataset(
-            X=X,
-            y=y,
-            feature_idx=feature_idx,
-        )
-
         X, y, feature_names_in, n_features_in = validate_Xy_fit(
             X,
             y,
@@ -414,7 +412,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         """
         byte_size, rng = self._initialize_model_variables()
         ensemble_configs, X, y, self.bardist_ = self._initialize_dataset_preprocessing(
-            X, y, self.feature_idx, rng
+            X, y, rng
         )
 
         self.X_ = X
@@ -422,6 +420,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         # TODO: handle constant targets
 
+        # TODO: See https://statproofbook.github.io/P/var-sum.html
         # mean, std = np.mean(y), np.std(y)
         # self.y_train_std_ = std.item() + 1e-20
         # self.y_train_mean_ = mean.item()
@@ -450,19 +449,13 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
     def finetune(self, X, y, contributions):
         pass
 
-    def forward(self, X, y, feature_idx, only_return_standard_out=True):
+    def forward(self, X, y, only_return_standard_out=True):
         """
-        Estimate feature importance embeddings.
+        Estimate feature importance embeddings. Used internally or for model tuning.
 
         NOTE: atm I'm assuming that the target is either a score or binary.
         """
         check_is_fitted(self)
-
-        X, y = prepare_explanation_dataset(
-            X=X,
-            y=y,
-            feature_idx=feature_idx,
-        )
 
         std_borders = self.bardist_.borders.cpu().numpy()
         outputs: list[torch.Tensor] = []
@@ -474,6 +467,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         for output, config in self.executor_.iter_outputs(
             X,
             y,
+            feature_idx=self.feature_idx,
             device=self.device_,
             autocast=self.use_autocast_,
             only_return_standard_out=only_return_standard_out,
@@ -580,7 +574,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
             _,  # averaged logits (not used here)
             outputs,  # list of tensors [N_est, N_samples, N_borders] (after forward)
             borders,  # list of numpy arrays containing borders for each estimator
-        ) = self.forward(X, y, self.feature_idx, only_return_standard_out=True)
+        ) = self.forward(X, y, only_return_standard_out=True)
 
         # Process outputs into probabilities, expected value and get final logits
         transformed_logits = [
@@ -641,9 +635,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         return logit_to_output(output_type=output_type)
 
     def get_embeddings(self, X, y):
-        output = self.forward(X, y, self.feature_idx, only_return_standard_out=True)[
-            "test_embeddings"
-        ]
+        output = self.forward(X, y, only_return_standard_out=True)["test_embeddings"]
         return output
 
     def save_foundation_model(self, path: Union[str, Path]):
