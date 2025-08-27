@@ -41,7 +41,6 @@ from tabpfn.config import ModelInterfaceConfig
 
 from explainerpfn.inference import InferenceEngineCachePreprocessing
 from explainerpfn.model_loading import load_model_criterion_config
-from explainerpfn.utils import prepare_explanation_dataset
 
 XType: TypeAlias = Any
 SampleWeightType: TypeAlias = Any
@@ -129,6 +128,22 @@ def initialize_explainerpfn_model(
         norm_criterion = bardist
 
     return model, config, norm_criterion
+
+
+def output_correction(
+    base_value, explanations: np.ndarray, y_test: np.ndarray
+) -> np.ndarray:
+
+    # Apply correction to ensure additivity (approach 2)
+    eps = (y_test - base_value) / explanations.sum(axis=1)
+    explanations_corrected = explanations * eps.reshape(-1, 1)
+
+    # This approach can lead to outliers, so we clip them
+    threshold = y_test.std() * 3
+    explanations_corrected = np.clip(
+        explanations_corrected, a_min=-threshold, a_max=threshold
+    )
+    return explanations_corrected
 
 
 def _logits_to_output(
@@ -227,23 +242,28 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
     def __init__(
         self,
-        feature_idx: int = 0,
         n_estimators: int = 1,
         categorical_features_indices: Sequence[int] | None = None,
         softmax_temperature=0.9,
         model_path="auto",
         device=None,
+        fit_mode: Literal[
+            "low_memory",
+            "fit_preprocessors",
+            "fit_with_cache",
+            "batched",
+        ] = "fit_with_cache",
         inference_precision: _dtype | Literal["autocast", "auto"] = "auto",
         memory_saving_mode: bool | Literal["auto"] | float | int = "auto",
         random_state=None,
         n_jobs: int = -1,
     ):
-        self.feature_idx = feature_idx
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
         self.softmax_temperature = softmax_temperature
         self.model_path = model_path
         self.device = device
+        self.fit_mode = fit_mode
         self.inference_precision = inference_precision
         self.memory_saving_mode = memory_saving_mode
         self.random_state = random_state
@@ -348,7 +368,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         self.model_, self.config_, self.bardist_ = initialize_explainerpfn_model(
             model_path=self.model_path,
-            fit_mode="fit_with_cache",
+            fit_mode=self.fit_mode,
         )
 
         # Get the device type and ensure it's a valid torch device
@@ -420,13 +440,16 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         # TODO: handle constant targets
 
-        # TODO: See https://statproofbook.github.io/P/var-sum.html
+        # TODO: Check if there's a way to improve this
+        self.y_train_std_ = np.std(y) + 1e-20
+        self.feature_exp_std_ = self.y_train_std_  # / np.sqrt(X.shape[1])
+        self.base_value_ = np.mean(y).item()
         # mean, std = np.mean(y), np.std(y)
         # self.y_train_std_ = std.item() + 1e-20
         # self.y_train_mean_ = mean.item()
         # y = (y - self.y_train_mean_) / self.y_train_std_
         self.normalized_bardist_ = FullSupportBarDistribution(
-            self.bardist_.borders  # * self.y_train_std_ + self.y_train_mean_,
+            self.bardist_.borders * self.feature_exp_std_  # + self.y_train_mean_,
         ).float()
 
         # Create the inference engine
@@ -446,10 +469,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         return self
 
-    def finetune(self, X, y, contributions):
-        pass
-
-    def forward(self, X, y, only_return_standard_out=True):
+    def forward(self, X, y, feature_idx, only_return_standard_out=True):
         """
         Estimate feature importance embeddings. Used internally or for model tuning.
 
@@ -467,7 +487,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         for output, config in self.executor_.iter_outputs(
             X,
             y,
-            feature_idx=self.feature_idx,
+            feature_idx=feature_idx,
             device=self.device_,
             autocast=self.use_autocast_,
             only_return_standard_out=only_return_standard_out,
@@ -536,6 +556,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         self,
         X,
         y,
+        feature_idx: int,
         output_type: Literal[
             "mean",
             "median",
@@ -574,7 +595,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
             _,  # averaged logits (not used here)
             outputs,  # list of tensors [N_est, N_samples, N_borders] (after forward)
             borders,  # list of numpy arrays containing borders for each estimator
-        ) = self.forward(X, y, only_return_standard_out=True)
+        ) = self.forward(X, y, feature_idx=feature_idx, only_return_standard_out=True)
 
         # Process outputs into probabilities, expected value and get final logits
         transformed_logits = [
@@ -634,8 +655,16 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         return logit_to_output(output_type=output_type)
 
-    def get_embeddings(self, X, y):
-        output = self.forward(X, y, only_return_standard_out=True)["test_embeddings"]
+    def get_embeddings(self, X, y, feature_idx: int):
+
+        # Check whether model is in inference mode
+        if not self.executor_.inference_mode:
+            self.executor_.use_torch_inference_mode(True)
+            self.model_.eval()
+
+        output = self.forward(
+            X, y, feature_idx=feature_idx, only_return_standard_out=True
+        )["test_embeddings"]
         return output
 
     def save_foundation_model(self, path: Union[str, Path]):
@@ -683,3 +712,97 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         torch.save(checkpoint, path)
 
         return self
+
+
+class ExplainerPFN(SingleFeatureExplainerPFN):
+    """
+    A class to handle the SHAP values for a PFN model.
+
+    NOTE: This is intended to be a proof of concept. It's meant to handle only
+    preprocessed data with standardized features and no missing values.
+    """
+
+    def __init__(
+        self,
+        n_estimators: int = 1,
+        categorical_features_indices: Sequence[int] | None = None,
+        softmax_temperature=0.9,
+        model_path="auto",
+        device=None,
+        fit_mode: Literal[
+            "low_memory",
+            "fit_preprocessors",
+            "fit_with_cache",
+            "batched",
+        ] = "fit_with_cache",
+        inference_precision: _dtype | Literal["autocast", "auto"] = "auto",
+        memory_saving_mode: bool | Literal["auto"] | float | int = "auto",
+        random_state=None,
+        n_jobs: int = -1,
+    ):
+        super().__init__(
+            n_estimators=n_estimators,
+            categorical_features_indices=categorical_features_indices,
+            softmax_temperature=softmax_temperature,
+            model_path=model_path,
+            device=device,
+            fit_mode=fit_mode,
+            inference_precision=inference_precision,
+            memory_saving_mode=memory_saving_mode,
+            random_state=random_state,
+            n_jobs=n_jobs,
+        )
+
+    def finetune(self, optimizer, X, y, shapley_values):
+
+        if self.executor_.inference_mode:
+            # Set model to training mode and disable inference mode to allow backprop
+            self.executor_.use_torch_inference_mode(False)
+            self.model_.train()
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Get logits
+        with torch.enable_grad():
+            # self.forward returns a tuple (first element are averaged logits across estimators)
+            all_features_logits = [
+                self.forward(
+                    X, y, feature_idx=feature_idx, only_return_standard_out=True
+                )[0]
+                for feature_idx in range(X.shape[1])
+            ]
+
+        logits = torch.concat(all_features_logits, axis=1)
+
+        # Convert SHAP values to tensor
+        shap_tensor = torch.tensor(shapley_values, dtype=torch.float32).to(self.device_)
+        shap_tensor = torch.concat(
+            [shap_tensor[:, i] for i in range(shap_tensor.shape[1])], dim=0
+        )
+
+        # Compute the loss
+        loss_per_sample = self.bardist_(logits.T, shap_tensor)
+
+        # Compute mean loss across all test samples
+        loss = loss_per_sample.mean()
+
+        # Backpropagate and update weights
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+    def predict(self, X: XType, y: YType) -> np.ndarray:
+
+        # Check whether model is in inference mode
+        if not self.executor_.inference_mode:
+            self.executor_.use_torch_inference_mode(True)
+            self.model_.eval()
+
+        explanations = np.zeros(X.shape)
+        for feature_idx in range(X.shape[1]):
+            explanations[:, feature_idx] = super().predict(
+                X, y, feature_idx=feature_idx
+            )
+        return explanations
