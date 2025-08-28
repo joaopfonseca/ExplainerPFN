@@ -34,3 +34,43 @@ def prepare_explanation_dataset(
         [y.reshape(-1, 1), X_], axis=1
     )  # Add the original target feature as the first column
     return X_concat, target_feature
+
+
+def explanation_correction(
+    explanations,
+    y_test,
+    base_value,
+    adjust_std=True,
+    process_outliers=True,
+    std_multiplier=3,
+):
+    """
+    Corrects the explanations to ensure additivity.
+
+    TODO/NOTE: This function is unfinished and does not work properly yet.
+    """
+    # Initial adjustment of explanations' std
+    if adjust_std:
+        exp_ = explanations * y_test.std() / explanations.std()
+    else:
+        exp_ = explanations
+
+    # Apply correction to ensure additivity (approach 2)
+    eps = (y_test - base_value) / exp_.sum(axis=1)
+    explanations_corrected = exp_ * eps.reshape(-1, 1)
+
+    # This approach can lead to outliers, so we replace them with the mean of each feature
+    if process_outliers:
+        threshold = y_test.std() * std_multiplier
+        explanations_corrected = np.where(
+            np.abs(explanations_corrected - explanations_corrected.mean(axis=1))
+            < threshold,
+            explanations_corrected,
+            np.nan,
+        )
+
+        mean = np.nanmean(explanations_corrected, axis=0)
+        idx = np.where(np.isnan(explanations_corrected))
+        explanations_corrected[idx] = np.take(mean, idx[1])
+
+    return explanations_corrected
