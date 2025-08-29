@@ -1,4 +1,4 @@
-from explainerpfn.train._synthetic_data import (
+from explainerpfn.train._directed_acyclical_graphs import (
     random_dag,
     redirection_sampling_dag,
     random_join,

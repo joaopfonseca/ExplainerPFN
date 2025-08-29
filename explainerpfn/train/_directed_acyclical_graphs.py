@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+from explainerpfn.train._activations import ACTIVATIONS
 
 
 def _check_random_state(random_state):
@@ -14,30 +15,6 @@ def _check_random_state(random_state):
             "random_state must be an int, None, or a np.random.Generator instance."
         )
     return rng
-
-
-def _propagate_values(DAG, random_state=None):
-    """Propagate values through the DAG."""
-    rng = _check_random_state(random_state)
-
-    node_values = {}
-    for node in nx.topological_sort(DAG):
-        parent_nodes = list(DAG.predecessors(node))
-        if not parent_nodes:
-            # For root nodes, assign random value
-            value = rng.normal()
-        else:
-            # NOTE: This is a linear connection
-            # TODO: Add more connection types
-            # For non-root nodes, use function of parent values (e.g., sum + some noise)
-            value = sum(
-                node_values[parent] * DAG.get_edge_data(parent, node)["weight"]
-                for parent in parent_nodes
-            )
-
-        node_values[node] = value
-
-    return dict(sorted(node_values.items()))
 
 
 def random_dag(n_nodes, edge_prob, random_state=None):
@@ -105,16 +82,41 @@ def plot_dag(DAG):
     plt.show()
 
 
-def generate_synthetic_data(DAG, num_samples=1000, random_state=None):
+def generate_synthetic_data(
+    DAG, n_samples=1000, exclude_edge=True, random_state=None, activations=None
+):
     """Generate synthetic data based on the DAG structure."""
     if isinstance(random_state, int) or random_state is None:
         rng = np.random.default_rng(random_state)
     else:
         rng = random_state
 
-    data = [_propagate_values(DAG, random_state=rng) for _ in range(num_samples)]
+    if activations is None:
+        activations = ACTIVATIONS
 
-    return pd.DataFrame(data)
+    ind_nodes = [n for n in DAG.nodes if DAG.in_degree(n) == 0]
+    dep_nodes = [n for n in nx.topological_sort(DAG) if n not in ind_nodes]
+    node_values = {n: rng.normal(size=n_samples) for n in ind_nodes}
+
+    for node in dep_nodes:
+        activation = rng.choice(activations)
+        source_nodes = list(DAG.predecessors(node))
+
+        # NOTE: This is a linear connection
+        # TODO: Add more connection types
+        # For non-root nodes, use function of parent values (e.g., sum + some noise)
+        values = sum(
+            activation(node_values[parent]) * DAG.get_edge_data(parent, node)["weight"]
+            for parent in source_nodes
+        )
+
+        node_values[node] = values
+
+    df = pd.DataFrame(dict(sorted(node_values.items())))
+    if exclude_edge:
+        df.drop(columns=ind_nodes, inplace=True)
+
+    return df
 
 
 def postprocess_synthetic_data(df, n_features=None, random_state=None):
