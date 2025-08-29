@@ -40,7 +40,7 @@ def _propagate_values(DAG, random_state=None):
     return dict(sorted(node_values.items()))
 
 
-def uniform_random_dag(n_nodes, edge_prob, random_state=None):
+def random_dag(n_nodes, edge_prob, random_state=None):
     """Generate a random Directed Acyclic Graph (DAG)."""
     rng = _check_random_state(random_state)
 
@@ -115,3 +115,18 @@ def generate_synthetic_data(DAG, num_samples=1000, random_state=None):
     data = [_propagate_values(DAG, random_state=rng) for _ in range(num_samples)]
 
     return pd.DataFrame(data)
+
+
+def postprocess_synthetic_data(df, n_features=None, random_state=None):
+    """Post-process the synthetic data."""
+    rng = _check_random_state(random_state)
+
+    if n_features is None:
+        n_features = df.shape[1]
+
+    df = df.loc[:, rng.choice(df.columns, size=n_features, replace=False)]
+    df = (df - df.mean()) / df.std(ddof=0)
+    df.columns = [i for i in range(df.shape[1] - 1)] + ["target"]
+    df.iloc[:, -1] = (df.iloc[:, -1] > 0).astype(int)
+
+    return df
