@@ -63,7 +63,10 @@ def explanation_correction(
     if process_outliers:
         threshold = y_test.std() * std_multiplier
         explanations_corrected = np.where(
-            np.abs(explanations_corrected - explanations_corrected.mean(axis=1))
+            np.abs(
+                explanations_corrected
+                - explanations_corrected.mean(axis=1).reshape(-1, 1)
+            )
             < threshold,
             explanations_corrected,
             np.nan,

@@ -1,20 +1,19 @@
-import numpy as np
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
 from explainerpfn.train._activations import ACTIVATIONS
+from explainerpfn.train.utils import _check_random_state
 
 
-def _check_random_state(random_state):
-    if isinstance(random_state, int) or random_state is None:
-        rng = np.random.default_rng(random_state)
-    elif isinstance(random_state, np.random.Generator):
-        rng = random_state
+def _initialization_sampling(n, rng, init_distr):
+    if init_distr == "normal":
+        return rng.normal(size=n)
+    elif init_distr == "uniform":
+        return rng.uniform(-1, 1, size=n)
+    elif init_distr == "mixed" or init_distr is None:
+        return rng.choice([rng.normal(size=n), rng.uniform(-1, 1, size=n)])
     else:
-        raise ValueError(
-            "random_state must be an int, None, or a np.random.Generator instance."
-        )
-    return rng
+        raise ValueError(f"Unknown initialization distribution: {init_distr}")
 
 
 def random_dag(n_nodes, edge_prob, random_state=None):
@@ -36,22 +35,22 @@ def redirection_sampling_dag(n_nodes, edge_prob, random_state=None):
     rng = _check_random_state(random_state)
 
     dag = nx.DiGraph()
-    dag.add_node(n_nodes)
+    dag.add_node(n_nodes - 1)
 
-    for source in range(n_nodes):
-        target = rng.choice(dag.nodes)
+    for source in range(n_nodes - 1):
+        target = rng.choice(list(dag.nodes))
         edge_weight = rng.uniform(-1, 1)
+        successors = list(dag.successors(target))
 
-        if rng.uniform() < edge_prob or len(list(dag.successors(target))) == 0:
-            dag.add_edge(source, target, weight=edge_weight)
-        else:
-            target = rng.choice(list(dag.successors(target)))
-            dag.add_edge(source, target, weight=edge_weight)
+        if rng.uniform() > edge_prob and len(successors) != 0:
+            target = rng.choice(successors)
+
+        dag.add_edge(source, target, weight=edge_weight)
 
     return dag
 
 
-def random_join(source_dag, target_dag, random_state=None):
+def random_join(source_dag, target_dag, edge_prob, random_state=None):
     """
     Randomly join two DAGs.
     """
@@ -62,9 +61,19 @@ def random_join(source_dag, target_dag, random_state=None):
 
     source_node = rng.choice(source_dag.nodes)
     target_node = rng.choice(target_dag.nodes)
-
+    edge_weight = rng.uniform(-1, 1)
     dag_join = nx.disjoint_union(source_dag, target_dag)
-    dag_join.add_edge(source_node, target_node, weight=rng.uniform(-1, 1))
+
+    target_successors = list(dag_join.successors(target_node))
+    if rng.uniform() > edge_prob and len(target_successors) != 0:
+        target_node = rng.choice(target_successors)
+
+    source_successors = list(dag_join.successors(source_node))
+    if rng.uniform() > edge_prob and len(source_successors) != 0:
+        source_node = rng.choice(source_successors)
+
+    dag_join.add_edge(source_node, target_node, weight=edge_weight)
+
     return dag_join
 
 
@@ -83,52 +92,57 @@ def plot_dag(DAG):
 
 
 def generate_synthetic_data(
-    DAG, n_samples=1000, exclude_edge=True, random_state=None, activations=None
+    DAG,
+    noise_std=0,
+    n_samples=1000,
+    activations=None,
+    init_distr="mixed",
+    return_dag_data=False,
+    random_state=None,
 ):
-    """Generate synthetic data based on the DAG structure."""
-    if isinstance(random_state, int) or random_state is None:
-        rng = np.random.default_rng(random_state)
-    else:
-        rng = random_state
+    """
+    Generate synthetic data based on the DAG structure.
+
+    init_distr: The distribution to use for initializing node values. Can be one
+    of:
+    - "normal": Gaussian distribution
+    - "uniform": Uniform distribution
+    - "mixed": Randomly choose between Gaussian and Uniform for each node
+    """
+    rng = _check_random_state(random_state)
 
     if activations is None:
         activations = ACTIVATIONS
 
     ind_nodes = [n for n in DAG.nodes if DAG.in_degree(n) == 0]
     dep_nodes = [n for n in nx.topological_sort(DAG) if n not in ind_nodes]
-    node_values = {n: rng.normal(size=n_samples) for n in ind_nodes}
+    node_values = {
+        n: _initialization_sampling(n_samples, rng, init_distr) for n in ind_nodes
+    }
 
     for node in dep_nodes:
         activation = rng.choice(activations)
         source_nodes = list(DAG.predecessors(node))
 
-        # NOTE: This is a linear connection
-        # TODO: Add more connection types
-        # For non-root nodes, use function of parent values (e.g., sum + some noise)
-        values = sum(
-            activation(node_values[parent]) * DAG.get_edge_data(parent, node)["weight"]
-            for parent in source_nodes
+        values = activation(
+            sum(
+                node_values[parent] * DAG.get_edge_data(parent, node)["weight"]
+                for parent in source_nodes
+            )
+            + rng.normal(0, noise_std, size=n_samples)
         )
 
         node_values[node] = values
 
     df = pd.DataFrame(dict(sorted(node_values.items())))
-    if exclude_edge:
-        df.drop(columns=ind_nodes, inplace=True)
+    df.columns = df.columns.astype(str)
+    df.rename(
+        columns={i: f"ind_{i}" if i in ind_nodes else f"dep_{i}" for i in df.columns},
+        inplace=True,
+    )
 
-    return df
-
-
-def postprocess_synthetic_data(df, n_features=None, random_state=None):
-    """Post-process the synthetic data."""
-    rng = _check_random_state(random_state)
-
-    if n_features is None:
-        n_features = df.shape[1]
-
-    df = df.loc[:, rng.choice(df.columns, size=n_features, replace=False)]
-    df = (df - df.mean()) / df.std(ddof=0)
-    df.columns = [i for i in range(df.shape[1] - 1)] + ["target"]
-    df.iloc[:, -1] = (df.iloc[:, -1] > 0).astype(int)
+    if return_dag_data:
+        dag_data = {"dag": DAG, "ind_nodes": ind_nodes, "dep_nodes": dep_nodes}
+        return df, dag_data
 
     return df
