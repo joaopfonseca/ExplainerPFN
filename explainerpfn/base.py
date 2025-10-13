@@ -23,7 +23,7 @@ from sklearn.preprocessing import FunctionTransformer
 from tabpfn.base import check_cpu_warning, determine_precision
 from explainerpfn.preprocessing import (
     ExplainerEnsembleConfig,
-    ReshapeFeatureDistributionsStep,
+    # ReshapeFeatureDistributionsStep,
     EnsembleConfig,
     PreprocessorConfig,
     default_explanation_preprocessor_configs,
