@@ -85,52 +85,52 @@ class PreprocessorConfig:
 
     name: Literal[
         "per_feature",  # a different transformation for each feature
-        "power",  # a standard sklearn power transformer
-        "safepower",  # a power transformer that prevents some numerical issues
-        "power_box",
-        "safepower_box",
-        "quantile_uni_coarse",  # quantile transformations with few quantiles up to many
-        "quantile_norm_coarse",
+        # "power",  # a standard sklearn power transformer
+        # "safepower",  # a power transformer that prevents some numerical issues
+        # "power_box",
+        # "safepower_box",
+        # "quantile_uni_coarse",  # quantile transformations with few quantiles up to many
+        # "quantile_norm_coarse",
         "quantile_uni",
-        "quantile_norm",
-        "quantile_uni_fine",
-        "quantile_norm_fine",
-        "robust",  # a standard sklearn robust scaler
-        "kdi",
+        # "quantile_norm",
+        # "quantile_uni_fine",
+        # "quantile_norm_fine",
+        # "robust",  # a standard sklearn robust scaler
+        # "kdi",
         "none",  # no transformation (only standardization in transformer)
-        "kdi_random_alpha",
-        "kdi_uni",
-        "kdi_random_alpha_uni",
-        "adaptive",
-        "norm_and_kdi",
-        # KDI with alpha collection
-        "kdi_alpha_0.3_uni",
-        "kdi_alpha_0.5_uni",
-        "kdi_alpha_0.8_uni",
-        "kdi_alpha_1.0_uni",
-        "kdi_alpha_1.2_uni",
-        "kdi_alpha_1.5_uni",
-        "kdi_alpha_2.0_uni",
-        "kdi_alpha_3.0_uni",
-        "kdi_alpha_5.0_uni",
-        "kdi_alpha_0.3",
-        "kdi_alpha_0.5",
-        "kdi_alpha_0.8",
-        "kdi_alpha_1.0",
-        "kdi_alpha_1.2",
-        "kdi_alpha_1.5",
-        "kdi_alpha_2.0",
-        "kdi_alpha_3.0",
-        "kdi_alpha_5.0",
+        # "kdi_random_alpha",
+        # "kdi_uni",
+        # "kdi_random_alpha_uni",
+        # "adaptive",
+        # "norm_and_kdi",
+        # # KDI with alpha collection
+        # "kdi_alpha_0.3_uni",
+        # "kdi_alpha_0.5_uni",
+        # "kdi_alpha_0.8_uni",
+        # "kdi_alpha_1.0_uni",
+        # "kdi_alpha_1.2_uni",
+        # "kdi_alpha_1.5_uni",
+        # "kdi_alpha_2.0_uni",
+        # "kdi_alpha_3.0_uni",
+        # "kdi_alpha_5.0_uni",
+        # "kdi_alpha_0.3",
+        # "kdi_alpha_0.5",
+        # "kdi_alpha_0.8",
+        # "kdi_alpha_1.0",
+        # "kdi_alpha_1.2",
+        # "kdi_alpha_1.5",
+        # "kdi_alpha_2.0",
+        # "kdi_alpha_3.0",
+        # "kdi_alpha_5.0",
     ]
     categorical_name: Literal[
         # categorical features are pretty much treated as ordinal, just not resorted
         "none",
         # categorical features are treated as numeric,
         # that means they are also power transformed for example
-        "numeric",
+        # "numeric",
         # "onehot": categorical features are onehot encoded
-        "onehot",
+        # "onehot",
         # "ordinal": categorical features are sorted and encoded as
         # integers from 0 to n_categories - 1
         "ordinal",
@@ -196,47 +196,47 @@ class PreprocessorConfig:
         )
 
 
-def default_classifier_preprocessor_configs() -> list[PreprocessorConfig]:
-    """Default preprocessor configurations for classification."""
-    return [
-        PreprocessorConfig(
-            "quantile_uni_coarse",
-            append_original="auto",
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd",
-            subsample_features=-1,
-        ),
-        PreprocessorConfig(
-            "none",
-            categorical_name="numeric",
-            subsample_features=-1,
-        ),
-    ]
+# def default_classifier_preprocessor_configs() -> list[PreprocessorConfig]:
+#     """Default preprocessor configurations for classification."""
+#     return [
+#         PreprocessorConfig(
+#             "quantile_uni_coarse",
+#             append_original="auto",
+#             categorical_name="ordinal_very_common_categories_shuffled",
+#             global_transformer_name="svd",
+#             subsample_features=-1,
+#         ),
+#         PreprocessorConfig(
+#             "none",
+#             categorical_name="numeric",
+#             subsample_features=-1,
+#         ),
+#     ]
 
 
-def default_regressor_preprocessor_configs() -> list[PreprocessorConfig]:
-    """Default preprocessor configurations for regression."""
-    return [
-        PreprocessorConfig(
-            "quantile_uni",
-            append_original="auto",
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd",
-        ),
-        PreprocessorConfig("safepower", categorical_name="onehot"),
-    ]
+# def default_regressor_preprocessor_configs() -> list[PreprocessorConfig]:
+#     """Default preprocessor configurations for regression."""
+#     return [
+#         PreprocessorConfig(
+#             "quantile_uni",
+#             append_original="auto",
+#             categorical_name="ordinal_very_common_categories_shuffled",
+#             global_transformer_name="svd",
+#         ),
+#         PreprocessorConfig("safepower", categorical_name="onehot"),
+#     ]
 
 
 def default_explanation_preprocessor_configs() -> list[PreprocessorConfig]:
     """Default preprocessor configurations for explanations."""
     return [
-        PreprocessorConfig(
-            "quantile_uni",
-            append_original="auto",
-            categorical_name="ordinal_very_common_categories_shuffled",
-            global_transformer_name="svd",
-        ),
-        PreprocessorConfig("safepower", categorical_name="ordinal"),
+        # PreprocessorConfig(
+        #     "quantile_uni",
+        #     append_original="auto",
+        #     categorical_name="ordinal_very_common_categories_shuffled",
+        #     global_transformer_name="svd",
+        # ),
+        PreprocessorConfig("none", categorical_name="ordinal"),
     ]
 
 
