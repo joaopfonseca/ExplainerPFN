@@ -30,7 +30,7 @@ from explainerpfn.model.preprocessing import (
     FeaturePreprocessingTransformerStep,
     NanHandlingPolynomialFeaturesStep,
     RemoveConstantFeaturesStep,
-    ReshapeFeatureDistributionsStep,
+    # ReshapeFeatureDistributionsStep,
     SequentialFeatureTransformer,
     ShuffleFeaturesStep,
 )
@@ -420,16 +420,16 @@ class EnsembleConfig:
         else:
             steps.extend(
                 [
-                    ReshapeFeatureDistributionsStep(
-                        transform_name=self.preprocess_config.name,
-                        append_to_original=self.preprocess_config.append_original,
-                        subsample_features=self.preprocess_config.subsample_features,
-                        global_transformer_name=self.preprocess_config.global_transformer_name,
-                        apply_to_categorical=(
-                            self.preprocess_config.categorical_name == "numeric"
-                        ),
-                        random_state=random_state,
-                    ),
+                    # ReshapeFeatureDistributionsStep(
+                    #     transform_name=self.preprocess_config.name,
+                    #     append_to_original=self.preprocess_config.append_original,
+                    #     subsample_features=self.preprocess_config.subsample_features,
+                    #     global_transformer_name=self.preprocess_config.global_transformer_name,
+                    #     apply_to_categorical=(
+                    #         self.preprocess_config.categorical_name == "numeric"
+                    #     ),
+                    #     random_state=random_state,
+                    # ),
                     EncodeCategoricalFeaturesStep(
                         self.preprocess_config.categorical_name,
                         random_state=random_state,

@@ -16,6 +16,8 @@ from torch.types import _dtype
 from sklearn import config_context
 from sklearn.base import TransformerMixin, check_is_fitted
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
+
 
 # from tabpfn import TabPFNRegressor
 from tabpfn.base import check_cpu_warning, determine_precision
@@ -316,10 +318,11 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         self.preprocessor_ = ord_encoder
 
         possible_target_transforms = (
-            ReshapeFeatureDistributionsStep.get_all_preprocessors(
-                num_examples=y.shape[0],  # Use length of validated y
-                random_state=rng,  # Use the provided rng
-            )
+            # ReshapeFeatureDistributionsStep.get_all_preprocessors(
+            #     num_examples=y.shape[0],  # Use length of validated y
+            #     random_state=rng,  # Use the provided rng
+            # )
+            {"none": FunctionTransformer()}
         )
         target_preprocessors: list[TransformerMixin | Pipeline | None] = []
         for (
