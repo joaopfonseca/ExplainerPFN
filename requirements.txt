@@ -4,4 +4,4 @@ scikit-learn
 tqdm
 matplotlib
 shap
-tabpfn
+tabpfn==2.1.2
