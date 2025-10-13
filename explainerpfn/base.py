@@ -491,6 +491,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
             X,
             y,
             feature_idx=feature_idx,
+            base_value=self.base_value_,
             device=self.device_,
             autocast=self.use_autocast_,
             only_return_standard_out=only_return_standard_out,
