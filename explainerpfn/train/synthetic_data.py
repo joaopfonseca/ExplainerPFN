@@ -27,7 +27,7 @@ class SyntheticDataGenerator:
         n_train_samples=[1, 2048],
         n_test_samples=128,
         n_features=[1, 160],
-        n_dags=[2, 20],
+        n_dags=[1, 10],
         n_nodes=[2, 10],  # Can be overriden during parameter sampling
         edge_prob=[0, 0.25],
         init_distr=["uniform", "normal", "mixed"],
@@ -43,7 +43,7 @@ class SyntheticDataGenerator:
         # self.max_cells = max_cells
         self.n_dags = n_dags
         self.n_nodes = n_nodes
-        self.edge_prob = edge_prob
+        self.edge_prob = (edge_prob,)
         self.init_distr = init_distr
         self.successor_as_target = successor_as_target
         self.random_state = random_state
@@ -65,10 +65,16 @@ class SyntheticDataGenerator:
             "n_train_samples": self._rng.integers(*self.n_train_samples),
             "n_test_samples": self.n_test_samples,
             "n_features": int(
-                self._rng.beta(a=0.95, b=8) * (self.n_features[1] - self.n_features[0])
-                + self.n_features[0]
+                np.round(
+                    self._rng.beta(a=0.95, b=10)
+                    * (self.n_features[1] - self.n_features[0])
+                    + self.n_features[0]
+                )
             ),
-            "n_dags": self._rng.integers(*self.n_dags),
+            "n_dags": int(
+                self._rng.beta(a=0.95, b=6) * (self.n_dags[1] - self.n_dags[0])
+                + self.n_dags[0]
+            ),
             "init_distr": self._rng.choice(self.init_distr),
             "successor_as_target": self._rng.choice(self.successor_as_target),
         }

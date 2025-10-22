@@ -22,7 +22,7 @@ def scores_to_ranking(y, direction=-1):
 #     Prepares a dataset for explanation by concatenating the target variable and features,
 #     and selecting a specific feature column as the explanation target. The target variable
 #     is added as the first column of the feature matrix.
-# 
+#
 #     Parameters
 #     ----------
 #     X : np.ndarray
@@ -31,7 +31,7 @@ def scores_to_ranking(y, direction=-1):
 #         Target vector of shape (n_samples,).
 #     feature_idx : int
 #         Index of the feature to be selected from `X`.
-# 
+#
 #     Returns
 #     -------
 #     X_concat : np.ndarray

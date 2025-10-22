@@ -325,9 +325,9 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
             {"none": FunctionTransformer()}
         )
         target_preprocessors: list[TransformerMixin | Pipeline | None] = []
-        for (
-            y_target_preprocessor
-        ) in ["none"]:  # self.interface_config_.REGRESSION_Y_PREPROCESS_TRANSFORMS:
+        for y_target_preprocessor in [
+            "none"
+        ]:  # self.interface_config_.REGRESSION_Y_PREPROCESS_TRANSFORMS:
             if y_target_preprocessor is not None:
                 preprocessor = possible_target_transforms[y_target_preprocessor]
             else:
