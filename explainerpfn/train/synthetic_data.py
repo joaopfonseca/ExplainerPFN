@@ -43,7 +43,7 @@ class SyntheticDataGenerator:
         # self.max_cells = max_cells
         self.n_dags = n_dags
         self.n_nodes = n_nodes
-        self.edge_prob = (edge_prob,)
+        self.edge_prob = edge_prob
         self.init_distr = init_distr
         self.successor_as_target = successor_as_target
         self.random_state = random_state
@@ -72,7 +72,7 @@ class SyntheticDataGenerator:
                 )
             ),
             "n_dags": int(
-                self._rng.beta(a=0.95, b=6) * (self.n_dags[1] - self.n_dags[0])
+                self._rng.beta(a=0.95, b=5) * (self.n_dags[1] - self.n_dags[0])
                 + self.n_dags[0]
             ),
             "init_distr": self._rng.choice(self.init_distr),
@@ -89,6 +89,7 @@ class SyntheticDataGenerator:
         # Check if the same parameters were already sampled
         if (
             hasattr(self, "params_")
+            and len(self.params_) > 0
             and (self.describe().iloc[:, :-1] == pd.Series(params).iloc[:-1])
             .all(axis=1)
             .any()
