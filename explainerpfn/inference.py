@@ -41,6 +41,7 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
 
     X_trains: Sequence[np.ndarray | torch.Tensor]
     y_trains: Sequence[np.ndarray | torch.Tensor]
+    feature_idx: int
     model: torch.nn.Module
     cat_ixs: Sequence[list[int]]
     ensemble_configs: Sequence[EnsembleConfig]
@@ -87,6 +88,69 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         Returns:
             The prepared inference engine.
         """
+        return [
+            InferenceEngineCachePreprocessing._prepare(  # type: ignore[misc]
+                X_train=X_train,
+                y_train=y_train,
+                feature_idx=feature_idx,
+                cat_ix=cat_ix,
+                model=model,
+                ensemble_configs=ensemble_configs,
+                n_workers=n_workers,
+                rng=rng,
+                dtype_byte_size=dtype_byte_size,
+                force_inference_dtype=force_inference_dtype,
+                save_peak_mem=save_peak_mem,
+                inference_mode=inference_mode,
+                no_preprocessing=no_preprocessing,
+            )
+            for feature_idx in range(X_train.shape[1])
+        ]
+
+    @classmethod
+    def _prepare(  # noqa: PLR0913
+        cls,
+        X_train: np.ndarray | torch.Tensor,
+        y_train: np.ndarray | torch.Tensor,
+        feature_idx: int,
+        *,
+        cat_ix: list[int],
+        model,
+        ensemble_configs: Sequence[EnsembleConfig],
+        n_workers: int,
+        rng: np.random.Generator,
+        dtype_byte_size: int,
+        force_inference_dtype: torch.dtype | None,
+        save_peak_mem: bool | Literal["auto"] | float | int,
+        inference_mode: bool,
+        no_preprocessing: bool = False,
+    ) -> "InferenceEngineCachePreprocessing":
+        """Prepare the inference engine.
+
+        Args:
+            X_train: The training data.
+            y_train: The training target.
+            cat_ix: The categorical indices.
+            model: The model to use.
+            ensemble_configs: The ensemble configurations to use.
+            n_workers: The number of workers to use.
+            rng: The random number generator.
+            dtype_byte_size: The byte size of the dtype.
+            force_inference_dtype: The dtype to force inference to.
+            save_peak_mem: Whether to save peak memory usage.
+            inference_mode: Whether to use torch.inference mode
+                (this is quicker but disables backpropagation)
+            no_preprocessing: If turned of, the preprocessing on the test
+                tensors is tuned off. Used for differentiablity.
+
+        Returns:
+            The prepared inference engine.
+        """
+        X_train, y_train = prepare_explanation_dataset(
+            X=X_train,
+            y=y_train,
+            feature_idx=feature_idx,
+        )
         itr = fit_preprocessing(
             configs=ensemble_configs,
             X_train=X_train,
@@ -100,6 +164,7 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         return InferenceEngineCachePreprocessing(
             X_trains=X_trains,
             y_trains=y_trains,
+            feature_idx=feature_idx,
             model=model,
             cat_ixs=cat_ixs,
             ensemble_configs=configs,
@@ -118,23 +183,24 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         y_train: np.ndarray | torch.Tensor,
         X: np.ndarray | torch.Tensor,
         y: np.ndarray | torch.Tensor,
-        feature_idx: int,
         config: EnsembleConfig,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare the inference data for by transforming the training and test data.
         """
-        X_train, y_train = prepare_explanation_dataset(
-            X=X_train,
-            y=y_train,
-            feature_idx=feature_idx,
-        )
+        print(X_train.shape, X.shape)
+        # X_train, y_train = prepare_explanation_dataset(
+        #     X=X_train,
+        #     y=y_train,
+        #     feature_idx=self.feature_idx,
+        # )
         X, y = prepare_explanation_dataset(
             X=X,
             y=y,
-            feature_idx=feature_idx,
+            feature_idx=self.feature_idx,
         )
+        print(X_train.shape, X.shape)
 
         if not isinstance(X_train, torch.Tensor):
             X_train = torch.as_tensor(X_train, dtype=torch.float32)  # noqa: PLW2901
@@ -178,8 +244,7 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         self,
         X: np.ndarray | torch.Tensor,
         y: np.ndarray | torch.Tensor,
-        feature_idx: int,
-        base_value: float,
+        #  base_value: float,
         *,
         device: torch.device,
         autocast: bool,
@@ -201,10 +266,9 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             X_full, y_full = self.prepare_inference_data(
                 preprocessor=preprocessor,
                 X_train=X_train,
-                y_train=y_train - base_value,
+                y_train=y_train,  # - base_value,
                 X=X,
-                y=y - base_value,
-                feature_idx=feature_idx,
+                y=y,  # - base_value,
                 config=config,
                 device=device,
             )

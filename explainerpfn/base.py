@@ -309,7 +309,6 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         # Ensure categories are ordinally encoded
         ord_encoder = _get_ordinal_encoder()
 
-        # NOTE: NAs should probably not be handled at all
         X = _process_text_na_dataframe(
             X,
             ord_encoder=ord_encoder,
@@ -485,13 +484,10 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         borders: list[np.ndarray] = []
 
         # Iterate over estimators
-        # TODO: Make this simpler and more readable
-        # TODO: Handle `feature_idx` on iter_outputs
-        for output, config in self.executor_.iter_outputs(
+        for output, config in self.executor_[feature_idx].iter_outputs(
             X,
             y,
-            feature_idx=feature_idx,
-            base_value=self.base_value_,
+            #  base_value=self.base_value_,
             device=self.device_,
             autocast=self.use_autocast_,
             only_return_standard_out=only_return_standard_out,
@@ -662,8 +658,8 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
     def get_embeddings(self, X, y, feature_idx: int):
 
         # Check whether model is in inference mode
-        if not self.executor_.inference_mode:
-            self.executor_.use_torch_inference_mode(True)
+        if not self.executor_[feature_idx].inference_mode:
+            self.executor_[feature_idx].use_torch_inference_mode(True)
             self.model_.eval()
 
         output = self.forward(
@@ -759,10 +755,13 @@ class ExplainerPFN(SingleFeatureExplainerPFN):
 
     def finetune(self, optimizer, X, y, shapley_values):
 
-        if self.executor_.inference_mode:
-            # Set model to training mode and disable inference mode to allow backprop
-            self.executor_.use_torch_inference_mode(False)
-            self.model_.train()
+        for executor in self.executor_:
+            if executor.inference_mode:
+                # Set model to training mode and disable inference mode to allow backprop
+                executor.use_torch_inference_mode(False)
+                executor.model_.train()
+
+        self.model_.train()
 
         # Zero gradients
         optimizer.zero_grad()
@@ -800,9 +799,12 @@ class ExplainerPFN(SingleFeatureExplainerPFN):
     def predict(self, X: XType, y: YType) -> np.ndarray:
 
         # Check whether model is in inference mode
-        if not self.executor_.inference_mode:
-            self.executor_.use_torch_inference_mode(True)
-            self.model_.eval()
+        for executor in self.executor_:
+            if not executor.inference_mode:
+                executor.use_torch_inference_mode(True)
+                executor.model_.eval()
+
+        self.model_.eval()
 
         explanations = np.zeros(X.shape)
         for feature_idx in range(X.shape[1]):
