@@ -78,9 +78,9 @@ def prepare_explanation_dataset(
     target_feature = X[:, feature_idx].copy()
     X_ = np.delete(X, feature_idx, axis=1)  # Remove the selected feature from X
     X_concat = np.concatenate(
-        [target_feature.reshape(-1, 1), X_], axis=1
-    )  # Add the original target feature as the first column
-    return X_concat, y
+        [y.reshape(-1, 1), target_feature.reshape(-1, 1), X_], axis=1
+    )  # Add the feature to be explained and the original target feature as the first two columns
+    return X_concat, target_feature
 
 
 def explanation_correction(

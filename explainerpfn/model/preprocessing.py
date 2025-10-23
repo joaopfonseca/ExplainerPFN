@@ -733,8 +733,11 @@ class ShuffleFeaturesStep(FeaturePreprocessingTransformerStep):
         else:
             raise ValueError(f"Unknown shuffle method {self.shuffle_method}")
 
-        # Ensure the first feature originally remains the first feature
+        # JOAO: Ensure the first feature originally remains the first feature
         index_permutation.insert(0, index_permutation.pop(index_permutation.index(0)))
+
+        # JOAO: Ensure the second feature originally remains the second feature
+        index_permutation.insert(1, index_permutation.pop(index_permutation.index(1)))
 
         if isinstance(X, torch.Tensor):
             self.index_permutation_ = torch.tensor(index_permutation, dtype=torch.long)
