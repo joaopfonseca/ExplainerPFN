@@ -189,7 +189,6 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         """
         Prepare the inference data for by transforming the training and test data.
         """
-        print(X_train.shape, X.shape)
         # X_train, y_train = prepare_explanation_dataset(
         #     X=X_train,
         #     y=y_train,
@@ -200,7 +199,6 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             y=y,
             feature_idx=self.feature_idx,
         )
-        print(X_train.shape, X.shape)
 
         if not isinstance(X_train, torch.Tensor):
             X_train = torch.as_tensor(X_train, dtype=torch.float32)  # noqa: PLW2901
