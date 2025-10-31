@@ -5,15 +5,15 @@ from explainerpfn.train._activations import ACTIVATIONS
 from explainerpfn.train.utils import _check_random_state
 
 
-def _initialization_sampling(n, rng, init_distr):
-    if init_distr == "normal":
-        return rng.normal(size=n)
-    elif init_distr == "uniform":
-        return rng.uniform(-1, 1, size=n)
-    elif init_distr == "mixed" or init_distr is None:
-        return rng.choice([rng.normal(size=n), rng.uniform(-1, 1, size=n)])
-    else:
-        raise ValueError(f"Unknown initialization distribution: {init_distr}")
+# def _initialization_sampling(n, rng, init_distr):
+#     if init_distr == "normal":
+#         return rng.normal(size=n)
+#     elif init_distr == "uniform":
+#         return rng.uniform(-1, 1, size=n)
+#     elif init_distr == "mixed" or init_distr is None:
+#         return rng.choice([rng.normal(size=n), rng.uniform(-1, 1, size=n)])
+#     else:
+#         raise ValueError(f"Unknown initialization distribution: {init_distr}")
 
 
 def random_dag(n_nodes, edge_prob, random_state=None):
@@ -96,7 +96,9 @@ def generate_synthetic_data(
     noise_std=0,
     n_samples=1000,
     activations=None,
-    init_distr="mixed",
+    alpha_range=[0, 5],
+    beta_range=[0, 5],
+    # init_distr="mixed",
     return_dag_data=False,
     random_state=None,
 ):
@@ -116,8 +118,12 @@ def generate_synthetic_data(
 
     ind_nodes = [n for n in DAG.nodes if DAG.in_degree(n) == 0]
     dep_nodes = [n for n in nx.topological_sort(DAG) if n not in ind_nodes]
+    alphas = rng.uniform(*alpha_range, size=len(ind_nodes))
+    betas = rng.uniform(*beta_range, size=len(ind_nodes))
     node_values = {
-        n: _initialization_sampling(n_samples, rng, init_distr) for n in ind_nodes
+        # n: _initialization_sampling(n_samples, rng, init_distr) for n in ind_nodes
+        n: rng.beta(alpha, beta, size=n_samples)
+        for n, alpha, beta in zip(ind_nodes, alphas, betas)
     }
 
     for node in dep_nodes:

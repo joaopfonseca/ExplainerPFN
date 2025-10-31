@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
-# from tqdm.auto import tqdm
+from tqdm.auto import tqdm
 from explainerpfn.train.utils import _check_random_state, postprocess_synthetic_data
 from explainerpfn.train._directed_acyclical_graphs import (
     generate_synthetic_data,
@@ -12,11 +12,8 @@ from explainerpfn.train._directed_acyclical_graphs import (
     random_join,
 )
 
-
-import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
-import networkx as nx
 import shap
 
 
@@ -30,8 +27,10 @@ class SyntheticDataGenerator:
         n_dags=[1, 10],
         n_nodes=[2, 10],  # Can be overriden during parameter sampling
         edge_prob=[0, 0.25],
-        init_distr=["uniform", "normal", "mixed"],
+        # init_distr=["uniform", "normal", "mixed"],
         # max_cells=75000,
+        alpha=[0, 5],
+        beta=[0, 5],
         successor_as_target=[True, False],
         random_state=None,
         n_jobs=-1,
@@ -44,7 +43,8 @@ class SyntheticDataGenerator:
         self.n_dags = n_dags
         self.n_nodes = n_nodes
         self.edge_prob = edge_prob
-        self.init_distr = init_distr
+        self.alpha = alpha
+        self.beta = beta
         self.successor_as_target = successor_as_target
         self.random_state = random_state
         self.n_jobs = n_jobs
@@ -75,7 +75,6 @@ class SyntheticDataGenerator:
                 self._rng.beta(a=0.95, b=5) * (self.n_dags[1] - self.n_dags[0])
                 + self.n_dags[0]
             ),
-            "init_distr": self._rng.choice(self.init_distr),
             "successor_as_target": self._rng.choice(self.successor_as_target),
         }
 
@@ -115,7 +114,7 @@ class SyntheticDataGenerator:
         n_nodes,
         n_dags,
         edge_prob,
-        init_distr,
+        # init_distr,
         n_train_samples,
         n_test_samples,
         n_features,
@@ -136,7 +135,7 @@ class SyntheticDataGenerator:
 
         data, dag_data = generate_synthetic_data(
             dag,
-            init_distr=init_distr,
+            # init_distr=init_distr,
             return_dag_data=True,
             random_state=self._rng,
             n_samples=n_train_samples + n_test_samples,
@@ -187,7 +186,7 @@ class SyntheticDataGenerator:
         df_exp.loc[:, relevant_mask] = shap_explanation
         return df_exp, y_pred
 
-    def generate(self, n_datasets=1):
+    def generate(self, n_datasets=1, verbose=False):
 
         if not hasattr(self, "params_"):
             self.params_ = []
@@ -197,8 +196,8 @@ class SyntheticDataGenerator:
             self.dags_ = []
             self.explanations_ = []
 
-        for _ in range(n_datasets):
-            print(_)
+        iter_ = tqdm(range(n_datasets)) if verbose else range(n_datasets)
+        for _ in iter_:
             params = self._sample_params()
             df, dag = self._dataset(**params)
             explanations, y_pred = self._explanations(df, dag)
