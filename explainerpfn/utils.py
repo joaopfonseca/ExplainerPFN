@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.linear_model import LinearRegression
 
 
 def scores_to_ranking(y, direction=-1):
@@ -83,11 +84,10 @@ def prepare_explanation_dataset(
     return X_concat, target_feature
 
 
-def explanation_correction(
+def multiplicative_correction(
     explanations,
     y_test,
     base_value,
-    adjust_std=True,
     process_outliers=True,
     std_multiplier=3,
 ):
@@ -96,15 +96,9 @@ def explanation_correction(
 
     TODO/NOTE: This function is unfinished and does not work properly yet.
     """
-    # Initial adjustment of explanations' std
-    if adjust_std:
-        exp_ = explanations * y_test.std() / explanations.std()
-    else:
-        exp_ = explanations
-
-    # Apply correction to ensure additivity (approach 2)
-    eps = (y_test - base_value) / exp_.sum(axis=1)
-    explanations_corrected = exp_ * eps.reshape(-1, 1)
+    # Apply correction to ensure additivity
+    eps = (y_test - base_value) / explanations.sum(axis=1)
+    explanations_corrected = explanations * eps.reshape(-1, 1)
 
     # This approach can lead to outliers, so we replace them with the mean of each feature
     if process_outliers:
@@ -123,4 +117,62 @@ def explanation_correction(
         idx = np.where(np.isnan(explanations_corrected))
         explanations_corrected[idx] = np.take(mean, idx[1])
 
+    return explanations_corrected
+
+
+def additive_correction(
+    explanations: np.ndarray,
+    y_test: np.ndarray,
+    base_value: float,
+):
+    """
+    Corrects the explanations to ensure additivity.
+    """
+    eps = (y_test - base_value) - explanations.sum(axis=1)
+    explanations_corrected = explanations + (eps.reshape(-1, 1) / explanations.shape[1])
+
+    # Alternative (original) code
+    # base_value = np.mean(y_train)
+    # error = y_test - (explanations.sum(axis=1) + base_value)
+    # error = (
+    #     np.repeat(error.reshape(-1, 1), repeats=explanations.shape[1], axis=1)
+    #     / explanations.shape[1]
+    # )
+    # explanations_corrected = explanations + error
+
+    return explanations_corrected
+
+
+def linear_correction(
+    explanations: np.ndarray,
+    y_test: np.ndarray,
+    base_value: float,
+    fit_intercept: bool = False,
+):
+    """
+    Corrects the explanations to ensure additivity using a linear regression.
+    """
+
+    # explanations = (explanations.copy() * np.abs(df.corr()["target"].drop("target").values))**3
+
+    model = LinearRegression(fit_intercept=fit_intercept)
+    model.fit(explanations, y_test - base_value)
+    explanations_corrected = explanations * np.abs(model.coef_.reshape(1, -1))
+
+    return explanations_corrected
+
+
+def statistical_correction(
+    explanations: np.ndarray,
+    y_test: np.ndarray,
+    *args
+    # base_value: float,
+):
+    """
+    Corrects the explanations to ensure additivity using statistical measures.
+    """
+
+    explanations_corrected = explanations - explanations.mean()
+    explanations_corrected /= explanations.std()
+    explanations_corrected *= y_test.std() / np.sqrt(explanations.shape[1])
     return explanations_corrected

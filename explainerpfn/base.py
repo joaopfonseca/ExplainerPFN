@@ -3,7 +3,7 @@ TODO: Test removing any std or mean corrections to the predicted values (!!!)
 """
 
 import typing
-from typing import Any, Literal, Union
+from typing import Any, List, Literal, Union
 from typing_extensions import TypeAlias, TypedDict
 from collections.abc import Sequence
 from pathlib import Path
@@ -43,6 +43,13 @@ from tabpfn.config import ModelInterfaceConfig
 
 from explainerpfn.inference import InferenceEngineCachePreprocessing
 from explainerpfn.model_loading import load_model_criterion_config
+from explainerpfn.utils import (
+    linear_correction,
+    additive_correction,
+    multiplicative_correction,
+    statistical_correction,
+)
+
 
 XType: TypeAlias = Any
 SampleWeightType: TypeAlias = Any
@@ -132,22 +139,6 @@ def initialize_explainerpfn_model(
     return model, config, norm_criterion
 
 
-def output_correction(
-    base_value, explanations: np.ndarray, y_test: np.ndarray
-) -> np.ndarray:
-
-    # Apply correction to ensure additivity (approach 2)
-    eps = (y_test - base_value) / explanations.sum(axis=1)
-    explanations_corrected = explanations * eps.reshape(-1, 1)
-
-    # This approach can lead to outliers, so we clip them
-    threshold = y_test.std() * 3
-    explanations_corrected = np.clip(
-        explanations_corrected, a_min=-threshold, a_max=threshold
-    )
-    return explanations_corrected
-
-
 def _logits_to_output(
     *,
     output_type: str,
@@ -232,7 +223,7 @@ def translate_probs_across_borders(
     return (prob_left[..., 1:] - prob_left[..., :-1]).clamp_min(0.0)
 
 
-class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
+class ExplainerPFN:  # (TabPFNRegressor):
     """
     A class to handle the SHAP values for a PFN model.
 
@@ -335,7 +326,6 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         # preprocess_transforms = self.interface_config_.PREPROCESS_TRANSFORMS
 
-        # TODO: NEEDS TO BE MODIFIED TO PRESERVE THE ORDER OF CERTAIN FEATURES
         ensemble_configs = EnsembleConfig.generate_for_explainability(
             n=self.n_estimators,  # refers to the number of estimators
             subsample_size=self.interface_config_.SUBSAMPLE_SAMPLES,
@@ -552,7 +542,7 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
         # TODO: Modify borders definition
         return averaged_logits, outputs, borders
 
-    def predict(
+    def predict_feature(
         self,
         X,
         y,
@@ -655,6 +645,54 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         return logit_to_output(output_type=output_type)
 
+    def predict(
+        self,
+        X: XType,
+        y: YType,
+        output_type: Literal[
+            "mean",
+            "median",
+            "mode",
+            "quantiles",
+            "full",
+            "main",
+        ] = "mean",
+        quantiles: list[float] | None = None,
+    ):
+
+        # Check whether model is in inference mode
+        for executor in self.executor_:
+            if not executor.inference_mode:
+                executor.use_torch_inference_mode(True)
+                executor.model_.eval()
+
+        self.model_.eval()
+
+        if output_type in ["mean", "median", "mode", "quantiles"]:
+            explanations = np.zeros(X.shape)
+            for feature_idx in range(X.shape[1]):
+                explanations[:, feature_idx] = self.predict_feature(
+                    X,
+                    y,
+                    feature_idx=feature_idx,
+                    output_type=output_type,
+                    quantiles=quantiles,
+                )
+        elif output_type in ["full", "main"]:
+            explanations = []
+            for feature_idx in range(X.shape[1]):
+                explanations.append(
+                    self.predict_feature(
+                        X,
+                        y,
+                        feature_idx=feature_idx,
+                        output_type=output_type,
+                        quantiles=quantiles,
+                    )
+                )
+
+        return explanations
+
     def get_embeddings(self, X, y, feature_idx: int):
 
         # Check whether model is in inference mode
@@ -713,46 +751,6 @@ class SingleFeatureExplainerPFN:  # (TabPFNRegressor):
 
         return self
 
-
-class ExplainerPFN(SingleFeatureExplainerPFN):
-    """
-    A class to handle the SHAP values for a PFN model.
-
-    NOTE: This is intended to be a proof of concept. It's meant to handle only
-    preprocessed data with standardized features and no missing values.
-    """
-
-    def __init__(
-        self,
-        n_estimators: int = 1,
-        categorical_features_indices: Sequence[int] | None = None,
-        softmax_temperature=0.9,
-        model_path="auto",
-        device=None,
-        fit_mode: Literal[
-            "low_memory",
-            "fit_preprocessors",
-            "fit_with_cache",
-            "batched",
-        ] = "fit_with_cache",
-        inference_precision: _dtype | Literal["autocast", "auto"] = "auto",
-        memory_saving_mode: bool | Literal["auto"] | float | int = "auto",
-        random_state=None,
-        n_jobs: int = -1,
-    ):
-        super().__init__(
-            n_estimators=n_estimators,
-            categorical_features_indices=categorical_features_indices,
-            softmax_temperature=softmax_temperature,
-            model_path=model_path,
-            device=device,
-            fit_mode=fit_mode,
-            inference_precision=inference_precision,
-            memory_saving_mode=memory_saving_mode,
-            random_state=random_state,
-            n_jobs=n_jobs,
-        )
-
     def finetune(self, optimizer, X, y, shapley_values):
 
         for executor in self.executor_:
@@ -796,19 +794,73 @@ class ExplainerPFN(SingleFeatureExplainerPFN):
 
         return loss.item()
 
-    def predict(self, X: XType, y: YType) -> np.ndarray:
+    def apply_correction(
+        self,
+        y: np.ndarray,
+        explanations: np.ndarray,
+        kind: Union[List[str], str] = "statistical",
+    ) -> np.ndarray:
+        """
+        Apply mean/std correction to the explanations.
 
-        # Check whether model is in inference mode
-        for executor in self.executor_:
-            if not executor.inference_mode:
-                executor.use_torch_inference_mode(True)
-                executor.model_.eval()
+        Parameters
+        ----------
+        explanations : array-like, shape (n_samples, n_features)
+            Raw explanations to be corrected.
 
-        self.model_.eval()
+        kind : str or list of str, optional
+            Type of correction to apply. Options are:
+            - "statistical": Adjust explanations to match the expected mean
+              and standard deviation of standard Shapley values.
+            - "multiplicative": Scale explanations multiplicatively based on
+              the target variable.
+            - "additive": Adjust explanations additively based on the target
+              variable.
+            - "linear": Apply a linear correction based on the target variable.
+            Can also be a list of these strings to apply multiple corrections
+            sequentially. Default is "statistical".
 
-        explanations = np.zeros(X.shape)
-        for feature_idx in range(X.shape[1]):
-            explanations[:, feature_idx] = super().predict(
-                X, y, feature_idx=feature_idx
+        Returns
+        -------
+        corrected_explanations : array-like, shape (n_samples, n_features)
+            Corrected explanations.
+        """
+        explanations = explanations.copy()
+        if isinstance(kind, list):
+            for k in kind:
+                explanations = self.apply_correction(
+                    y,
+                    explanations,
+                    kind=k,
+                )
+            return explanations
+
+        if kind == "statistical":
+            corrected_explanations = statistical_correction(
+                explanations,
+                y,
             )
-        return explanations
+        elif kind == "multiplicative":
+            corrected_explanations = multiplicative_correction(
+                explanations,
+                y,
+                base_value=self.base_value_,
+            )
+        elif kind == "additive":
+            corrected_explanations = additive_correction(
+                explanations,
+                y,
+                base_value=self.base_value_,
+            )
+        elif kind == "linear":
+            corrected_explanations = linear_correction(
+                explanations,
+                y,
+                base_value=self.base_value_,
+            )
+        else:
+            raise NotImplementedError(
+                f"Explanation correction of kind '{kind}' is not implemented " "yet."
+            )
+
+        return corrected_explanations
