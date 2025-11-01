@@ -157,20 +157,20 @@ class SyntheticDataGenerator:
             X, y, test_size=0.5, random_state=self.random_state
         )
 
-        df_exp = df.copy().iloc[:, :-1] * np.nan
+        # df_exp = df.copy().iloc[:, :-1] * np.nan
 
-        nodes = [int(col.split("_")[-1]) for col in df.columns]
-        relevant_nodes = [n for n in nodes if nx.has_path(dag, n, nodes[-1])]
-        relevant_mask = df.columns.map(
-            lambda x: int(x.split("_")[-1]) in relevant_nodes
-        ).to_numpy()[:-1]
-        df_exp.loc[:, ~relevant_mask] = 0
+        # nodes = [int(col.split("_")[-1]) for col in df.columns]
+        # relevant_nodes = [n for n in nodes if nx.has_path(dag, n, nodes[-1])]
+        # relevant_mask = df.columns.map(
+        #     lambda x: int(x.split("_")[-1]) in relevant_nodes
+        # ).to_numpy()[:-1]
+        # df_exp.loc[:, ~relevant_mask] = 0
 
-        if relevant_mask.sum() == 0:
-            relevant_mask += True
+        # if relevant_mask.sum() == 0:
+        #     relevant_mask += True
 
-        X_train = X_train.loc[:, relevant_mask]
-        X_test = X_test.loc[:, relevant_mask]
+        # X_train = X_train.loc[:, relevant_mask]
+        # X_test = X_test.loc[:, relevant_mask]
 
         clf = MLPClassifier(
             max_iter=2000,
@@ -179,11 +179,16 @@ class SyntheticDataGenerator:
             random_state=self.random_state,
         )
         clf.fit(X_train, y_train)
-        y_pred = clf.predict_proba(X.loc[:, relevant_mask])[:, -1]
+        # y_pred = clf.predict_proba(X.loc[:, relevant_mask])[:, -1]
+        y_pred = clf.predict_proba(X)[:, -1]
 
         xai = shap.Explainer(model=clf.predict_proba, masker=X_train)
-        shap_explanation = xai(X.loc[:, relevant_mask]).values[:, :, 1]
-        df_exp.loc[:, relevant_mask] = shap_explanation
+        # shap_explanation = xai(X.loc[:, relevant_mask]).values[:, :, 1]
+        shap_explanation = xai(X).values[:, :, 1]
+        # df_exp.loc[:, relevant_mask] = shap_explanation
+        df_exp = pd.DataFrame(
+            shap_explanation, columns=X.columns, index=X.index
+        )
         return df_exp, y_pred
 
     def generate(self, n_datasets=1, verbose=False):
