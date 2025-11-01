@@ -469,7 +469,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """
         check_is_fitted(self)
 
-        std_borders = self.bardist_.borders.cpu().numpy()
+        std_borders = self.normalized_bardist_.borders.cpu().numpy()
         outputs: list[torch.Tensor] = []
         borders: list[np.ndarray] = []
 
@@ -592,7 +592,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
             translate_probs_across_borders(
                 logits,
                 frm=torch.as_tensor(borders_t, device=self.device_),
-                to=self.bardist_.borders.to(self.device_),
+                to=self.normalized_bardist_.borders.to(self.device_),
             )
             for logits, borders_t in zip(outputs, borders)
         ]
