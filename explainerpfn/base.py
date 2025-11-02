@@ -434,7 +434,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
         # TODO: Check if there's a way to improve this
         self.y_train_std_ = np.std(y) + 1e-20
-        self.feature_exp_std_ = self.y_train_std_ / np.sqrt(X.shape[1])
+        self.feature_exp_std_ = self.y_train_std_  # / np.sqrt(X.shape[1])
         self.base_value_ = np.mean(y).item()
         # mean, std = np.mean(y), np.std(y)
         # self.y_train_std_ = std.item() + 1e-20
