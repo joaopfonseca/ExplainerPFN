@@ -469,7 +469,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """
         check_is_fitted(self)
 
-        std_borders = self.normalized_bardist_.borders.cpu().numpy()
+        std_borders = self.bardist_.borders.cpu().numpy()
         outputs: list[torch.Tensor] = []
         borders: list[np.ndarray] = []
 
