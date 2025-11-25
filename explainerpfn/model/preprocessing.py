@@ -772,38 +772,7 @@ class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
         # TODO(eddiebergman): Bad to keep calling skew again and again here...
         column_types = []
         for col in range(X.shape[1]):
-            if np.unique(X[:, col]).size < 10:
-                column_types.append(f"ordinal_{col}")
-            elif (
-                skew(X[:, col]) > 1.1
-                and np.min(X[:, col]) >= 0
-                and np.max(X[:, col]) <= 1
-            ):
-                column_types.append(f"skewed_pos_1_0_{col}")
-            elif skew(X[:, col]) > 1.1 and np.min(X[:, col]) > 0:
-                column_types.append(f"skewed_pos_{col}")
-            elif skew(X[:, col]) > 1.1:
-                column_types.append(f"skewed_{col}")
-            elif shapiro(X[0:3000, col]).statistic > 0.95:
-                column_types.append(f"normal_{col}")
-            else:
-                column_types.append(f"other_{col}")
-        return column_types
 
-
-class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
-    """Reshape the feature distributions using different transformations."""
-
-    APPEND_TO_ORIGINAL_THRESHOLD = 500
-
-    @staticmethod
-    def get_column_types(X: np.ndarray) -> list[str]:
-        """Returns a list of column types for the given data, that indicate how
-        the data should be preprocessed.
-        """
-        # TODO(eddiebergman): Bad to keep calling skew again and again here...
-        column_types = []
-        for col in range(X.shape[1]):
             if np.unique(X[:, col]).size < 10:
                 column_types.append(f"ordinal_{col}")
             elif (

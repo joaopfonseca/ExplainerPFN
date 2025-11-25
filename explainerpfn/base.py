@@ -23,7 +23,7 @@ from sklearn.preprocessing import FunctionTransformer
 from tabpfn.base import check_cpu_warning, determine_precision
 from explainerpfn.preprocessing import (
     ExplainerEnsembleConfig,
-    # ReshapeFeatureDistributionsStep,
+    ReshapeFeatureDistributionsStep,
     EnsembleConfig,
     PreprocessorConfig,
     default_explanation_preprocessor_configs,
@@ -39,7 +39,7 @@ from tabpfn.utils import (
     _process_text_na_dataframe,
     _transform_borders_one,
 )
-from tabpfn.config import ModelInterfaceConfig
+from explainerpfn.config import ModelInterfaceConfig
 
 from explainerpfn.inference import InferenceEngineCachePreprocessing
 from explainerpfn.model_loading import load_model_criterion_config
@@ -308,16 +308,18 @@ class ExplainerPFN:  # (TabPFNRegressor):
         self.preprocessor_ = ord_encoder
 
         possible_target_transforms = (
-            # ReshapeFeatureDistributionsStep.get_all_preprocessors(
-            #     num_examples=y.shape[0],  # Use length of validated y
-            #     random_state=rng,  # Use the provided rng
-            # )
-            {"none": FunctionTransformer()}
+            ReshapeFeatureDistributionsStep.get_all_preprocessors(
+                num_examples=y.shape[0],  # Use length of validated y
+                random_state=rng,  # Use the provided rng
+            )
+            # {"none": FunctionTransformer()}
         )
         target_preprocessors: list[TransformerMixin | Pipeline | None] = []
-        for y_target_preprocessor in [
-            "none"
-        ]:  # self.interface_config_.REGRESSION_Y_PREPROCESS_TRANSFORMS:
+        for y_target_preprocessor in (
+            # "none"
+            # self.interface_config_.REGRESSION_Y_PREPROCESS_TRANSFORMS
+            self.interface_config_.EXPLANATION_Y_PREPROCESS_TRANSFORMS
+        ):
             if y_target_preprocessor is not None:
                 preprocessor = possible_target_transforms[y_target_preprocessor]
             else:
@@ -860,7 +862,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
             )
         else:
             raise NotImplementedError(
-                f"Explanation correction of kind '{kind}' is not implemented " "yet."
+                f"Explanation correction of kind '{kind}' is not implemented "
+                "yet."
             )
 
         return corrected_explanations

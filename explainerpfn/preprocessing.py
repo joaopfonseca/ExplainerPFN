@@ -30,7 +30,7 @@ from explainerpfn.model.preprocessing import (
     FeaturePreprocessingTransformerStep,
     NanHandlingPolynomialFeaturesStep,
     RemoveConstantFeaturesStep,
-    # ReshapeFeatureDistributionsStep,
+    ReshapeFeatureDistributionsStep,
     SequentialFeatureTransformer,
     ShuffleFeaturesStep,
 )
@@ -86,7 +86,7 @@ class PreprocessorConfig:
     name: Literal[
         "per_feature",  # a different transformation for each feature
         # "power",  # a standard sklearn power transformer
-        # "safepower",  # a power transformer that prevents some numerical issues
+        "safepower",  # a power transformer that prevents some numerical issues
         # "power_box",
         # "safepower_box",
         # "quantile_uni_coarse",  # quantile transformations with few quantiles up to many
@@ -230,13 +230,13 @@ class PreprocessorConfig:
 def default_explanation_preprocessor_configs() -> list[PreprocessorConfig]:
     """Default preprocessor configurations for explanations."""
     return [
-        # PreprocessorConfig(
-        #     "quantile_uni",
-        #     append_original="auto",
-        #     categorical_name="ordinal_very_common_categories_shuffled",
-        #     global_transformer_name="svd",
-        # ),
-        PreprocessorConfig("none", categorical_name="ordinal"),
+        PreprocessorConfig(
+            "quantile_uni",
+            append_original=False,
+            categorical_name="ordinal_very_common_categories_shuffled",
+            global_transformer_name="svd",
+        ),
+        PreprocessorConfig("safepower", categorical_name="ordinal"),
     ]
 
 
@@ -420,16 +420,16 @@ class EnsembleConfig:
         else:
             steps.extend(
                 [
-                    # ReshapeFeatureDistributionsStep(
-                    #     transform_name=self.preprocess_config.name,
-                    #     append_to_original=self.preprocess_config.append_original,
-                    #     subsample_features=self.preprocess_config.subsample_features,
-                    #     global_transformer_name=self.preprocess_config.global_transformer_name,
-                    #     apply_to_categorical=(
-                    #         self.preprocess_config.categorical_name == "numeric"
-                    #     ),
-                    #     random_state=random_state,
-                    # ),
+                    ReshapeFeatureDistributionsStep(
+                        transform_name=self.preprocess_config.name,
+                        append_to_original=self.preprocess_config.append_original,
+                        subsample_features=self.preprocess_config.subsample_features,
+                        global_transformer_name=self.preprocess_config.global_transformer_name,
+                        apply_to_categorical=(
+                            self.preprocess_config.categorical_name == "numeric"
+                        ),
+                        random_state=random_state,
+                    ),
                     EncodeCategoricalFeaturesStep(
                         self.preprocess_config.categorical_name,
                         random_state=random_state,

@@ -301,8 +301,6 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             yield output, config
         if self.inference_mode:  # if inference
             self.model = self.model.cpu()
-        X_full.cpu()
-        y_full.cpu()
 
     @override
     def use_torch_inference_mode(self, use_inference: bool):
