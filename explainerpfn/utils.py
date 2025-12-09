@@ -1,3 +1,4 @@
+from typing import List
 import numpy as np
 from sklearn.linear_model import LinearRegression
 
@@ -171,6 +172,9 @@ def statistical_correction(
     """
     Corrects the explanations to ensure additivity using statistical measures.
     """
+    # if isinstance(explanations, list):
+    #     outputs = explanations
+    #     explanations = np.array([exp["mean"] for exp in outputs]).T
 
     explanations_corrected = explanations - explanations.mean()
     explanations_corrected /= explanations.std()

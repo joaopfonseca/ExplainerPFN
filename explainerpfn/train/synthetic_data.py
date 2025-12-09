@@ -119,6 +119,7 @@ class SyntheticDataGenerator:
         n_test_samples,
         n_features,
         successor_as_target,
+        activations=None,
     ):
         dag = redirection_sampling_dag(
             n_nodes=n_nodes[0], edge_prob=edge_prob, random_state=self._rng
@@ -138,6 +139,7 @@ class SyntheticDataGenerator:
             # init_distr=init_distr,
             return_dag_data=True,
             random_state=self._rng,
+            activations=activations,
             n_samples=n_train_samples + n_test_samples,
         )
         df = postprocess_synthetic_data(
@@ -191,7 +193,7 @@ class SyntheticDataGenerator:
         )
         return df_exp, y_pred
 
-    def generate(self, n_datasets=1, verbose=False):
+    def generate(self, n_datasets=1, verbose=False, activations=None):
 
         if not hasattr(self, "params_"):
             self.params_ = []
@@ -204,7 +206,7 @@ class SyntheticDataGenerator:
         iter_ = tqdm(range(n_datasets)) if verbose else range(n_datasets)
         for _ in iter_:
             params = self._sample_params()
-            df, dag = self._dataset(**params)
+            df, dag = self._dataset(**params, activations=activations)
             explanations, y_pred = self._explanations(df, dag)
 
             self.params_.append(params)
