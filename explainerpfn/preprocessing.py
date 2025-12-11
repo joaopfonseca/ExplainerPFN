@@ -231,12 +231,12 @@ def default_explanation_preprocessor_configs() -> list[PreprocessorConfig]:
     """Default preprocessor configurations for explanations."""
     return [
         PreprocessorConfig(
-            "quantile_uni",
+            "robust",
             append_original=False,
             categorical_name="ordinal_very_common_categories_shuffled",
             global_transformer_name="svd",
         ),
-        PreprocessorConfig("safepower", categorical_name="ordinal"),
+        # PreprocessorConfig("safepower", categorical_name="ordinal"),
     ]
 
 
