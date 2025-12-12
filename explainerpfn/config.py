@@ -119,7 +119,7 @@ class ModelInterfaceConfig:
     EXPLANATION_Y_PREPROCESS_TRANSFORMS: tuple[
         Literal["safepower", "power", "quantile_norm", None],
         ...,
-    ] = ("safepower",)
+    ] = (None,)
 
     """The preprocessing applied to the target variable before passing it to TabPFN for
     regression. This can be understood as scaling the target variable to better predict
