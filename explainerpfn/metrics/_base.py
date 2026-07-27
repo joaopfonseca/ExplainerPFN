@@ -1,9 +1,10 @@
 from itertools import product, combinations
 import numpy as np
+import pandas as pd
 from scipy.spatial.distance import euclidean
+from scipy.stats import spearmanr
 from sklearn.preprocessing import normalize
 from explainerpfn.utils import scores_to_ranking
-import pandas as pd
 
 
 # Not reviewed
@@ -305,6 +306,149 @@ def row_wise_euclidean(results1, results2, normalization=True):
 
 
 # Reviewed
+def spearman_agreement(results1, results2):
+    """
+    Calculate the Spearman rank correlation between two sets of contributions
+    across a dataset.
+
+    Parameters
+    ----------
+    results1 : pandas.DataFrame
+        The first set of contributions results.
+    results2 : pandas.DataFrame
+        The second set of contributions results.
+
+    Returns
+    -------
+    pandas.Series
+        A pandas Series containing the Spearman correlation values for each pair
+        of contributions vectors in `results1` and `results2`.
+    """
+    return results1.reset_index(drop=True).apply(
+        lambda row: spearmanr(row, results2.iloc[row.name])[0],
+        axis=1,
+    )
+
+
+def bootstrap_correlation_ci(
+    results1,
+    results2,
+    n_bootstrap=50,
+    random_state=42,
+    metric="pearson",
+    ci=0.95,
+):
+    """
+    Compute bootstrap confidence intervals for a correlation metric between two
+    sets of contributions.
+
+    Parameters
+    ----------
+    results1 : pandas.DataFrame or np.ndarray
+        The first set of contributions results.
+    results2 : pandas.DataFrame or np.ndarray
+        The second set of contributions results.
+    n_bootstrap : int, default=50
+        Number of bootstrap resamples.
+    random_state : int, default=42
+        Random seed for reproducibility.
+    metric : {"pearson", "spearman"}, default="pearson"
+        Correlation metric to compute.
+    ci : float, default=0.95
+        Confidence interval level (e.g., 0.95 for 95% CI).
+
+    Returns
+    -------
+    dict
+        Dictionary with keys "mean", "lower", "upper", and "std".
+    """
+    rng = np.random.default_rng(random_state)
+    n_samples = len(results1)
+    results1 = np.asarray(results1)
+    results2 = np.asarray(results2)
+
+    correlations = []
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n_samples, size=n_samples)
+        r1 = results1[idx]
+        r2 = results2[idx]
+        if metric == "pearson":
+            corr = np.corrcoef(r1.flatten(), r2.flatten())[0, 1]
+        elif metric == "spearman":
+            corr = spearmanr(r1.flatten(), r2.flatten())[0]
+        else:
+            raise ValueError(f"Unsupported metric: {metric}")
+        correlations.append(corr)
+
+    correlations = np.array(correlations)
+    alpha = 1 - ci
+    return {
+        "mean": float(np.mean(correlations)),
+        "lower": float(np.percentile(correlations, 100 * alpha / 2)),
+        "upper": float(np.percentile(correlations, 100 * (1 - alpha / 2))),
+        "std": float(np.std(correlations)),
+    }
+
+
+def bootstrap_agreement_ci(
+    results1,
+    results2,
+    agreement_fn,
+    n_bootstrap=50,
+    random_state=42,
+    ci=0.95,
+    **agreement_kwargs,
+):
+    """
+    Compute bootstrap confidence intervals for an agreement function between two
+    sets of contributions.
+
+    Parameters
+    ----------
+    results1 : pandas.DataFrame
+        The first set of contributions results.
+    results2 : pandas.DataFrame
+        The second set of contributions results.
+    agreement_fn : callable
+        Agreement function (e.g., jaccard_agreement, kendall_agreement).
+    n_bootstrap : int, default=50
+        Number of bootstrap resamples.
+    random_state : int, default=42
+        Random seed for reproducibility.
+    ci : float, default=0.95
+        Confidence interval level.
+    **agreement_kwargs
+        Additional keyword arguments passed to `agreement_fn`.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys "mean", "lower", "upper", and "std".
+    """
+    rng = np.random.default_rng(random_state)
+    n_samples = len(results1)
+    results1 = results1.reset_index(drop=True)
+    results2 = results2.reset_index(drop=True)
+
+    scores = []
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n_samples, size=n_samples)
+        r1 = results1.iloc[idx].reset_index(drop=True)
+        r2 = results2.iloc[idx].reset_index(drop=True)
+        score = agreement_fn(r1, r2, **agreement_kwargs).mean()
+        scores.append(score)
+
+    scores = np.array(scores)
+    alpha = 1 - ci
+    return {
+        "mean": float(np.mean(scores)),
+        "lower": float(np.percentile(scores, 100 * alpha / 2)),
+        "upper": float(np.percentile(scores, 100 * (1 - alpha / 2))),
+        "std": float(np.std(scores)),
+    }
+
+
+# Reviewed
 def euclidean_agreement(results1, results2, normalization):
     """
     Calculate the Euclidean agreement between two sets of contributions across a
@@ -420,4 +564,5 @@ _MEASURES = {
     "euclidean": euclidean_agreement,
     "jaccard": jaccard_agreement,
     "kendall": kendall_agreement,
+    "spearman": spearman_agreement,
 }

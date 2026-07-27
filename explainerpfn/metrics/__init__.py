@@ -1,4 +1,11 @@
-from ._base import kendall_agreement, jaccard_agreement, euclidean_agreement
+from ._base import (
+    kendall_agreement,
+    jaccard_agreement,
+    euclidean_agreement,
+    spearman_agreement,
+    bootstrap_correlation_ci,
+    bootstrap_agreement_ci,
+)
 from ._sensitivity import (
     outcome_sensitivity,
     explanation_sensitivity,
@@ -15,6 +22,9 @@ __all__ = [
     "kendall_agreement",
     "jaccard_agreement",
     "euclidean_agreement",
+    "spearman_agreement",
+    "bootstrap_correlation_ci",
+    "bootstrap_agreement_ci",
     "outcome_sensitivity",
     "explanation_sensitivity",
     "explanation_sensitivity_all_neighbors",
