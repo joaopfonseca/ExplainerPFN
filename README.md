@@ -8,6 +8,8 @@ zero-shot feature importance estimation** without requiring access to the
 original prediction model, making it ideal for model-agnostic explainability in
 tabular data scenarios.
 
+**IMPORTANT: This project was developed as a proof-of-concept. This model is not sufficiently reliable for production use. Please use it for research and experimentation purposes only.**
+
 ## Key Features
 
 - **Zero-shot Explainability**: Predict feature contributions without retraining or access to the original model
