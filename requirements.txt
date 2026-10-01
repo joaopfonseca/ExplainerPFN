@@ -6,3 +6,4 @@ matplotlib
 shap
 tabpfn==2.1.2
 folktables
+xgboost
