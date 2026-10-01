@@ -482,13 +482,15 @@ class PerFeatureTransformer(nn.Module):
 
             y[k] = y[k].transpose(0, 1)  # b s 1 -> s b 1
 
-        # TODO: commented out. check if this is correct
-        # making sure no label leakage ever happens
-        # y["main"][single_eval_pos:] = torch.nan
+        # Make sure no label leakage ever happens: the targets at the query
+        # positions must not be visible to the model. This mirrors the
+        # pretraining protocol, where query targets are missing (NaN) and are
+        # handled by the NaN-handling encoder steps.
+        y["main"][single_eval_pos:] = torch.nan
 
         embedded_y = self.y_encoder(
             y,
-            single_eval_pos=y["main"].shape[0],
+            single_eval_pos=single_eval_pos,
             cache_trainset_representation=self.cache_trainset_representation,
         ).transpose(0, 1)
 

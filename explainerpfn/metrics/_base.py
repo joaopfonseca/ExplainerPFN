@@ -4,7 +4,6 @@ import pandas as pd
 from scipy.spatial.distance import euclidean
 from scipy.stats import spearmanr
 from sklearn.preprocessing import normalize
-from explainerpfn.utils import scores_to_ranking
 
 
 # Not reviewed
@@ -34,7 +33,14 @@ def _find_neighbors(
     distances = np.apply_along_axis(
         lambda row: euclidean(row, row_data), 1, data_neighbors
     )
-    neighbors_idx = np.argpartition(distances, -n_neighbors)[-n_neighbors:]
+    n_select = min(n_neighbors, len(distances))
+    if n_select == 0:
+        return data_neighbors, cont_neighbors
+    # ``argpartition(d, k)[:k]`` yields the ``k`` *smallest* distances, i.e. the
+    # closest neighbors. (Using ``-n_neighbors`` would select the farthest.)
+    neighbors_idx = np.argpartition(distances, n_select - 1)[:n_select]
+    # Sort the selected neighbors by distance for deterministic ordering.
+    neighbors_idx = neighbors_idx[np.argsort(distances[neighbors_idx])]
     data_neighbors = data_neighbors[neighbors_idx]
     cont_neighbors = cont_neighbors[neighbors_idx]
     return data_neighbors, cont_neighbors
@@ -79,26 +85,43 @@ def _find_all_neighbors(
 
 # Reviewed
 def _get_importance_mask(row_cont, threshold):
+    # ``row_cont`` is a single row of contributions. It may come in as a pandas
+    # Series (from ``DataFrame.apply(axis=1)``) or as a plain numpy array (from
+    # the sensitivity/consistency metrics). Normalize to a Series with a
+    # positional index so the pandas-based logic below works either way.
+    row_cont = pd.Series(
+        np.asarray(row_cont).ravel(),
+        index=range(np.asarray(row_cont).size),
+        dtype=float,
+    )
     if threshold >= 1:
         # Calculate order of absolute contributions
         row_abs = np.abs(row_cont)
         # Find n=threshold largest items
-        res = sorted(row_abs.index.values, key=lambda sub: row_abs[sub])[-threshold:]
+        res = sorted(row_abs.index.values, key=lambda sub: row_abs[sub])[-int(threshold):]
         # Set mask
         mask = pd.Series(
             data=[True if i in res else False for i in row_cont.index.values],
             index=row_cont.index.values,
         )
     else:
-        # Calculate cumulative absolute contribution order
-        total_contribution = np.sum(np.abs(row_cont))
-        order = np.argsort(np.abs(row_cont))
-        cumulative_cont = np.cumsum(np.abs(row_cont)[order]) / total_contribution
-        # Find elements withe the smallest contribution
-        # (to meet the threshold it's easier to do the reverse operation)
-        mask = (cumulative_cont < 1 - threshold)[order]
-        # Reverse array
-        mask = ~mask
+        # Select the smallest set of features whose cumulative absolute
+        # contribution reaches ``threshold`` of the total. Walk the features in
+        # descending order of |contribution| and keep them until the running
+        # sum meets the threshold. This is the minimal set with mass
+        # ``>= threshold`` (a plain ascending-cumulative comparison would keep
+        # an extra feature whenever the boundary is hit exactly).
+        abs_cont = np.abs(row_cont).to_numpy()
+        order = np.argsort(abs_cont)[::-1]
+        cumulative = np.cumsum(abs_cont[order])
+        total = cumulative[-1] if len(cumulative) else 0.0
+        if total == 0:
+            selected = np.zeros_like(abs_cont, dtype=bool)
+        else:
+            n_keep = int(np.searchsorted(cumulative, threshold * total, side="left")) + 1
+            selected = np.zeros_like(abs_cont, dtype=bool)
+            selected[order[:n_keep]] = True
+        mask = pd.Series(data=selected, index=row_cont.index.values)
 
     # Check whether ties exist
     possible_configs = [mask.copy()]
@@ -147,31 +170,56 @@ def jaccard_similarity(a, b):
 def kendall_similarity(a, b):
     """
     Compute the Kendall similarity between two rankings.
-    The Kendall similarity is a measure of the correspondence between two rankings.
-    It is derived from the Kendall tau rank correlation coefficient.
+
+    This is Kendall's tau-b (which accounts for ties in either ranking),
+    rescaled to ``[0, 1]`` via ``(tau + 1) / 2``. Pairs are compared on the
+    *same* indices in both rankings, so ties cannot misalign the pair lists.
+    If either ranking is constant, the correlation is undefined and a neutral
+    similarity of ``0.5`` is returned.
+
     Parameters
     ----------
     a : list
         The first ranking list.
     b : list
         The second ranking list.
+
     Returns
     -------
     float
         The Kendall similarity between the two rankings, ranging from 0 to 1.
     """
-    normalizer = (len(a) * (len(a) - 1)) / 2
-    idx_pair = list(combinations(range(len(a)), 2))
-    val_pair_a = [(a[i], a[j]) for i, j in idx_pair if a[i] != a[j]]
-    val_pair_b = [(b[i], b[j]) for i, j in idx_pair if b[i] != b[j]]
-    inversions = 0
-    for (val11, val12), (val21, val22) in zip(val_pair_a, val_pair_b):
-        if ((val11 > val12) and (val21 < val22)) or (
-            (val11 < val12) and (val21 > val22)
-        ):
-            inversions = inversions + 1
-    kt = 1 - (2 * inversions) / normalizer
-    return (kt + 1) / 2
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    n = len(a)
+    if n < 2:
+        return 0.5
+
+    idx_pair = list(combinations(range(n), 2))
+    concordant = 0
+    discordant = 0
+    ties_a = 0
+    ties_b = 0
+    for i, j in idx_pair:
+        da = a[i] - a[j]
+        db = b[i] - b[j]
+        if da == 0:
+            ties_a += 1
+        if db == 0:
+            ties_b += 1
+        if da != 0 and db != 0:
+            if (da > 0) == (db > 0):
+                concordant += 1
+            else:
+                discordant += 1
+
+    n_pairs = n * (n - 1) / 2
+    denominator = np.sqrt((n_pairs - ties_a) * (n_pairs - ties_b))
+    if denominator == 0:
+        # One of the rankings is constant: correlation is undefined.
+        return 0.5
+    tau = (concordant - discordant) / denominator
+    return float((tau + 1) / 2)
 
 
 # Reviewed
@@ -200,15 +248,26 @@ def row_wise_kendall(results1, results2):
     """
     results = [results1, results2]
 
-    # Check for ties
+    # Convert to ranks with standard average-rank tie handling, so that
+    # ``kendall_similarity`` sees comparable values while ties remain encoded
+    # as equal ranks.
     ranks = []
     for result in results:
-        rank = scores_to_ranking(result, direction=1)
-        # Correct rank values to reflect ties
-        for val in result:
-            mask = result == val
-            if mask.sum() > 1:
-                rank[mask] = rank[mask].max()
+        result = np.asarray(result, dtype=float)
+        order = np.argsort(result)
+        sorted_result = result[order]
+        ranks_sorted = np.empty(len(result), dtype=float)
+        i = 0
+        while i < len(result):
+            j = i
+            while j + 1 < len(result) and sorted_result[j + 1] == sorted_result[i]:
+                j += 1
+            # Average rank assigned to the tied group (1-based).
+            average_rank = (i + j) / 2 + 1
+            ranks_sorted[i : j + 1] = average_rank
+            i = j + 1
+        rank = np.empty(len(result), dtype=float)
+        rank[order] = ranks_sorted
         ranks.append(rank)
 
     row_sensitivity = kendall_similarity(ranks[0], ranks[1])
@@ -216,7 +275,7 @@ def row_wise_kendall(results1, results2):
 
 
 # Reviewed
-def row_wise_jaccard(results1, results2, n_features):
+def row_wise_jaccard(results1, results2, n_features=0.8):
     """
     Calculate the row-wise Jaccard similarity between two sets of results.
 

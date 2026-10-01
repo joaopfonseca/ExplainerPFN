@@ -141,10 +141,16 @@ def generate_synthetic_data(
         node_values[node] = values
 
     df = pd.DataFrame(dict(sorted(node_values.items())))
-    df.columns = df.columns.astype(str)
-    df.rename(
-        columns={i: f"ind_{i}" if i in ind_nodes else f"dep_{i}" for i in df.columns},
-        inplace=True,
+    # Node ids are integers. Build an explicit int->label mapping (comparing
+    # integers, not stringified column names) so source nodes get ``ind_``
+    # labels; otherwise *every* column would be labelled ``dep_`` and source
+    # nodes could be selected as prediction targets.
+    ind_nodes_set = {int(n) for n in ind_nodes}
+    df = df.rename(
+        columns={
+            node: (f"ind_{node}" if int(node) in ind_nodes_set else f"dep_{node}")
+            for node in node_values
+        },
     )
 
     if return_dag_data:

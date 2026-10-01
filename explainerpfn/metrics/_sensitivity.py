@@ -1,4 +1,5 @@
 import numpy as np
+from itertools import product
 from sklearn.utils import check_random_state
 from explainerpfn.utils import scores_to_ranking
 from ._base import (
@@ -21,30 +22,42 @@ def _pairwise_outcome_sensitivity(
     stds,
     rng,
 ):
-    # Find the most important features
-    masks = [
-        _get_importance_mask(row_cont, threshold) for row_cont in [row_cont1, row_cont2]
-    ]
-    mask1, mask2 = masks
+    # ``_get_importance_mask`` returns a *list* of possible masks when ties
+    # exist (one per admissible selection). Evaluate the perturbation for each
+    # admissible pair and average; this avoids the previous bug where a
+    # perturbation was multiplied by a list of masks.
+    mask_configs1 = _get_importance_mask(row_cont1, threshold)
+    mask_configs2 = _get_importance_mask(row_cont2, threshold)
 
-    # Apply perturbation to the most important features
-    perturbations = [rng.normal(loc=0, scale=stds) for _ in range(n_tests)]
-    rows_pert1 = np.array([row_data1 + pert * mask1 for pert in perturbations])
-    rows_pert2 = np.array([row_data2 + pert * mask2 for pert in perturbations])
+    all_diffs = []
+    for mask1, mask2 in product(mask_configs1, mask_configs2):
+        mask1_arr = np.asarray(mask1, dtype=bool)
+        mask2_arr = np.asarray(mask2, dtype=bool)
 
-    # Compute the prediction gap fidelity
-    pert_ranks = []
-    for rows_pert in [rows_pert1, rows_pert2]:
-        rows_pert_score = score_func(rows_pert)
-        rows_pert_rank = np.array(
-            [
-                scores_to_ranking(np.append(original_scores, score))[-1]
-                for score in rows_pert_score
-            ]
+        # Apply perturbation to the most important features
+        perturbations = [rng.normal(loc=0, scale=stds) for _ in range(n_tests)]
+        rows_pert1 = np.array(
+            [row_data1 + pert * mask1_arr for pert in perturbations]
         )
-        pert_ranks.append(rows_pert_rank)
+        rows_pert2 = np.array(
+            [row_data2 + pert * mask2_arr for pert in perturbations]
+        )
 
-    return np.abs(pert_ranks[0] - pert_ranks[1]).mean()
+        # Compute the prediction gap fidelity
+        pert_ranks = []
+        for rows_pert in [rows_pert1, rows_pert2]:
+            rows_pert_score = score_func(rows_pert)
+            rows_pert_rank = np.array(
+                [
+                    scores_to_ranking(np.append(original_scores, score))[-1]
+                    for score in rows_pert_score
+                ]
+            )
+            pert_ranks.append(rows_pert_rank)
+
+        all_diffs.append(np.abs(pert_ranks[0] - pert_ranks[1]).mean())
+
+    return float(np.mean(all_diffs))
 
 
 def row_based_outcome_sensitivity(

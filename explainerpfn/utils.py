@@ -10,8 +10,8 @@ def scores_to_ranking(y, direction=-1):
     If higher rank values are better, set direction to 1 instead.
     """
     temp = np.argsort(y * direction)
-    ranks = np.zeros(*y.shape, dtype=int)
-    ranks[temp] = np.arange(*y.shape) + 1
+    ranks = np.zeros(y.shape, dtype=int)
+    ranks[temp] = np.arange(y.shape[0]) + 1
     return ranks
 
 
