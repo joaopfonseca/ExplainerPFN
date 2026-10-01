@@ -26,9 +26,14 @@ def postprocess_synthetic_data(
     """
     rng = _check_random_state(random_state)
 
-    # Exclude independent/source nodes if specified
+    # Exclude independent/source nodes if specified. Columns are named with the
+    # ``ind_<node>`` prefix (see ``generate_synthetic_data``); the raw node ids
+    # in ``dag_data`` are integers, so map them to the column names first.
     if dag_data is not None and exclude_ind_nodes:
-        df.drop(columns=dag_data["ind_nodes"], inplace=True)
+        ind_cols = [f"ind_{n}" for n in dag_data["ind_nodes"]]
+        # ``errors="ignore"`` keeps the recursive retry below (which passes the
+        # already-processed frame again) from failing on missing columns.
+        df.drop(columns=ind_cols, inplace=True, errors="ignore")
 
     n_features = (
         df.shape[1] - 1 if n_features is None else min(n_features, df.shape[1] - 1)

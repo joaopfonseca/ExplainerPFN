@@ -151,6 +151,22 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             y=y_train,
             feature_idx=feature_idx,
         )
+        # ``prepare_explanation_dataset`` prepends the model score and the
+        # feature being explained, and removes the latter from the feature
+        # block. The categorical indices were inferred on the raw feature
+        # matrix, so they have to be remapped to the new column layout:
+        #   - the explained feature (raw index ``feature_idx``) is at column 1
+        #   - features before it are shifted by +2 (score + explained feature)
+        #   - features after it are shifted by +1 (only the score is prepended)
+        # The score column (0) is never categorical.
+        cat_ix = [
+            1
+            if c == feature_idx
+            else c + 2
+            if c < feature_idx
+            else c + 1
+            for c in cat_ix
+        ]
         itr = fit_preprocessing(
             configs=ensemble_configs,
             X_train=X_train,
@@ -214,26 +230,20 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
             y_train = torch.as_tensor(y_train, dtype=torch.float32)  # noqa: PLW2901
         y_train = y_train.to(device)  # noqa: PLW2901
 
-        y_test = (
-            config.target_transform.transform(
-                y.reshape(-1, 1),
-            ).ravel()
-            if config.target_transform is not None
-            else y
-        )
-        if not isinstance(y_test, torch.Tensor):
-            y_test = torch.as_tensor(y_test, dtype=torch.float32)  # noqa: PLW2901
-        y_test = y_test.to(device)  # noqa: PLW2901
-        y_full = torch.cat([y_train, y_test], dim=0).unsqueeze(1)
-
-        # batched_cat_ix = [cat_ix]
+        # Only the training targets are passed to the model. The query (test)
+        # positions are intentionally left without a target: the transformer
+        # pads them with NaN (see ``PerFeatureTransformer.forward``), matching
+        # the protocol the backbone was pretrained with. Feeding the query
+        # feature values here lets the model trivially copy them instead of
+        # inferring the contribution from the in-context data.
+        y_full = y_train.unsqueeze(1)
 
         # Handle type casting
         with contextlib.suppress(Exception):  # Avoid overflow error
             X_full = X_full.float()
         if self.force_inference_dtype is not None:
             X_full = X_full.type(self.force_inference_dtype)
-            y_full = y_train.type(self.force_inference_dtype)  # type: ignore # noqa: PLW2901
+            y_full = y_full.type(self.force_inference_dtype)  # type: ignore # noqa: PLW2901
 
         return X_full, y_full
 

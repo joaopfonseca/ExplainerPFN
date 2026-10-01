@@ -22,7 +22,6 @@ from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import (
     FunctionTransformer,
     MinMaxScaler,
-    OneHotEncoder,
     OrdinalEncoder,
     PowerTransformer,
     QuantileTransformer,
@@ -379,6 +378,33 @@ def _identity(x: T) -> T:
     return x
 
 
+def _restore_column_order(X: np.ndarray, *, out_order: Sequence[int]) -> np.ndarray:
+    """Restore the original column order after a ``ColumnTransformer``.
+
+    ``ColumnTransformer`` always emits the explicitly transformed columns first
+    (in the order they were declared), followed by the remainder. For the
+    explainer pipeline we need the column order to be preserved, otherwise the
+    model score and the explained feature (which the explainer expects at
+    positions 0 and 1) would be silently moved around.
+
+    Args:
+        X: The (possibly extended) transformed data.
+        out_order: ``out_order[i]`` is the original column index emitted at
+            position ``i``.
+
+    Returns:
+        ``X`` with the first ``len(out_order)`` columns reordered back to their
+        original order. Any additional columns (e.g. appended SVD components)
+        are left untouched.
+    """
+    restore = np.argsort(np.asarray(out_order))
+    n = len(out_order)
+    X = np.asarray(X)
+    if X.shape[1] == n:
+        return X[:, restore]
+    return np.concatenate([X[:, :n][:, restore], X[:, n:]], axis=1)
+
+
 inf_to_nan_transformer = FunctionTransformer(
     func=_inf_to_nan_func,
     inverse_func=_identity,
@@ -600,6 +626,10 @@ class SequentialFeatureTransformer(UserList):
 class RemoveConstantFeaturesStep(FeaturePreprocessingTransformerStep):
     """Remove features that are constant in the training data."""
 
+    # Positions that must survive the removal: the model score and the feature
+    # being explained (see ``prepare_explanation_dataset``).
+    PROTECTED_FEATURES: tuple[int, ...] = (0, 1)
+
     def __init__(self) -> None:
         super().__init__()
         self.sel_: list[bool] | None = None
@@ -612,6 +642,12 @@ class RemoveConstantFeaturesStep(FeaturePreprocessingTransformerStep):
             sel_ = torch.max(X[0:1, :] != X, dim=0)[0].cpu()
         else:
             sel_ = ((X[0:1, :] == X).mean(axis=0) < 1.0).tolist()
+
+        # Columns 0 and 1 hold the model score and the feature being explained.
+        # They must never be dropped: the explainer identifies them by position.
+        for protected in self.PROTECTED_FEATURES:
+            if protected < len(sel_):
+                sel_[protected] = True
 
         if not any(sel_):
             raise ValueError(
@@ -1058,25 +1094,18 @@ class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
             n_samples,
             random_state=static_seed,
         )
+        # The explainer pipeline relies on the model score and the explained
+        # feature staying at columns 0 and 1 of the transformed data. The
+        # branches below would change the dimensionality or reorder columns in
+        # ways that break that invariant, so they are not supported here.
         if self.subsample_features > 0:
-            subsample_features = int(self.subsample_features * n_features) + 1
-            # sampling more features than exist
-            replace = subsample_features > n_features
-            self.subsampled_features_ = rng.choice(
-                list(range(n_features)),
-                subsample_features,
-                replace=replace,
+            raise NotImplementedError(
+                "Feature subsampling is not supported by the explainer pipeline:"
+                " it changes the number of columns and would move the model score"
+                " and the explained feature out of positions 0 and 1.",
             )
-            categorical_features = [
-                new_idx
-                for new_idx, idx in enumerate(self.subsampled_features_)
-                if idx in categorical_features
-            ]
-            n_features = subsample_features
-        else:
-            self.subsampled_features_ = np.arange(n_features)
+        self.subsampled_features_ = np.arange(n_features)
 
-        all_feats_ix = list(range(n_features))
         transformers = []
 
         numerical_ix = [i for i in range(n_features) if i not in categorical_features]
@@ -1087,53 +1116,40 @@ class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
             if self.append_to_original == "auto"
             else self.append_to_original
         )
-
-        # NOTE: Regarding keeping the original features, read below.
-        # -------- Append to original ------
-        # If we append to original, all the categorical indices are kept in place
-        # as the first transform is a passthrough on the whole X as it is above
-        if self.append_to_original and self.apply_to_categorical:
-            trans_ixs = categorical_features + numerical_ix
-            transformers.append(("original", "passthrough", all_feats_ix))
-            cat_ix = categorical_features  # Exist as they are in original
-
-        elif self.append_to_original and not self.apply_to_categorical:
-            trans_ixs = numerical_ix
-            # Includes the categoricals passed through
-            transformers.append(("original", "passthrough", all_feats_ix))
-            cat_ix = categorical_features  # Exist as they are in original
+        if self.append_to_original:
+            raise NotImplementedError(
+                "append_to_original is not supported by the explainer pipeline:"
+                " it changes the dimensionality and would move the explained"
+                " feature out of position 1.",
+            )
+        if self.apply_to_categorical:
+            raise NotImplementedError(
+                "apply_to_categorical is not supported by the explainer pipeline:"
+                " categorical features must be ordinal-encoded (by the next"
+                " step) to preserve the input dimensionality.",
+            )
 
         # -------- Don't append to original ------
         # We only have categorical indices if we don't transform them
         # The first transformer will be a passthrough on the categorical indices
-        # Making them the first
-        elif not self.append_to_original and self.apply_to_categorical:
-            trans_ixs = categorical_features + numerical_ix
-            cat_ix = []  # We have none left, they've been transformed
-
-        elif not self.append_to_original and not self.apply_to_categorical:
-            trans_ixs = numerical_ix
-            transformers.append(("cats", "passthrough", categorical_features))
-            cat_ix = list(range(len(categorical_features)))  # They are at start
-
-        else:
-            raise ValueError(
-                f"Unrecognized combination of {self.apply_to_categorical=}"
-                f" and {self.append_to_original=}",
-            )
+        # Making them the first -- restored to the original order below.
+        trans_ixs = numerical_ix
+        transformers.append(("cats", "passthrough", categorical_features))
+        cat_ix = list(categorical_features)  # Kept in their original positions
 
         # NOTE: No need to keep track of categoricals here, already done above
-        if self.transform_name != "per_feature":
-            _transformer = all_preprocessors[self.transform_name]
-            transformers.append(("feat_transform", _transformer, trans_ixs))
-        else:
-            preprocessors = list(all_preprocessors.values())
-            transformers.extend(
-                [
-                    (f"transformer_{i}", rng.choice(preprocessors), [i])  # type: ignore
-                    for i in trans_ixs
-                ],
+        if self.transform_name == "per_feature":
+            raise NotImplementedError(
+                "The 'per_feature' preprocessor is not supported by the explainer"
+                " pipeline.",
             )
+        _transformer = all_preprocessors[self.transform_name]
+        transformers.append(("feat_transform", _transformer, trans_ixs))
+
+        # ColumnTransformer emits the passthrough categorical columns first,
+        # followed by the transformed numerical ones. Record the original
+        # column index emitted at each position so the order can be restored.
+        self.output_order_ = list(categorical_features) + list(numerical_ix)
 
         transformer = ColumnTransformer(
             transformers,
@@ -1183,6 +1199,7 @@ class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
             categorical_features,
         )
         Xt = transformer.fit_transform(X[:, self.subsampled_features_])
+        Xt = _restore_column_order(Xt, out_order=self.output_order_)
         self.categorical_features_after_transform_ = cat_ix
         self.transformer_ = transformer
         return _TransformResult(Xt, cat_ix)  # type: ignore
@@ -1190,7 +1207,8 @@ class ReshapeFeatureDistributionsStep(FeaturePreprocessingTransformerStep):
     @override
     def _transform(self, X: np.ndarray, *, is_test: bool = False) -> np.ndarray:
         assert self.transformer_ is not None, "You must call fit first"
-        return self.transformer_.transform(X[:, self.subsampled_features_])  # type: ignore
+        Xt = self.transformer_.transform(X[:, self.subsampled_features_])  # type: ignore
+        return _restore_column_order(Xt, out_order=self.output_order_)
 
 
 class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
@@ -1260,29 +1278,28 @@ class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
             return ct, categorical_features
 
         if self.categorical_transform_name == "onehot":
-            # Create a column transformer
-            ct = ColumnTransformer(
-                [
-                    (
-                        "one_hot_encoder",
-                        OneHotEncoder(
-                            drop="if_binary",
-                            sparse_output=False,
-                            handle_unknown="ignore",
-                        ),
-                        categorical_features,
-                    ),
-                ],
-                # The column numbers to be transformed
-                remainder="passthrough",  # Leave the rest of the columns untouched
+            raise NotImplementedError(
+                "One-hot encoding is not supported by the explainer pipeline:"
+                " it changes the input dimensionality. Use ordinal encoding"
+                " instead.",
             )
-            return ct, categorical_features
 
         if self.categorical_transform_name in ("numeric", "none"):
             return None, categorical_features
         raise ValueError(
             f"Unknown categorical transform {self.categorical_transform_name}",
         )
+
+    def _set_output_order(self, n_features: int, categorical_features: list[int]) -> None:
+        """Record the column order emitted by the ``ColumnTransformer``.
+
+        The ordinal ``ColumnTransformer`` emits the encoded categorical columns
+        first, followed by the passthrough remainder. The explainer pipeline
+        needs the original order back, so store the emitted layout.
+        """
+        encoded = set(categorical_features)
+        remainder = [i for i in range(n_features) if i not in encoded]
+        self.output_order_ = list(categorical_features) + remainder
 
     def _fit(
         self,
@@ -1298,11 +1315,13 @@ class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
 
         if self.categorical_transform_name.startswith("ordinal"):
             ct.fit(X)
-            categorical_features = list(range(len(categorical_features)))
+            # Categorical columns keep their original positions after the
+            # order is restored (see ``_restore_column_order``).
+            self._set_output_order(X.shape[1], categorical_features)
 
             self.random_mappings_ = {}
             if self.categorical_transform_name.endswith("_shuffled"):
-                for col_ix in categorical_features:
+                for col_ix in range(len(categorical_features)):
                     col_cats = len(
                         ct.named_transformers_["ordinal_encoder"].categories_[col_ix],
                     )
@@ -1310,13 +1329,9 @@ class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
                     self.random_mappings_[col_ix] = perm
 
         elif self.categorical_transform_name == "onehot":
-            Xt = ct.fit_transform(X)
-            if Xt.size >= 1_000_000:
-                ct = None
-            else:
-                categorical_features = list(range(Xt.shape[1]))[
-                    ct.output_indices_["one_hot_encoder"]
-                ]
+            raise NotImplementedError(
+                "One-hot encoding is not supported by the explainer pipeline.",
+            )
         else:
             raise ValueError(
                 f"Unknown categorical transform {self.categorical_transform_name}",
@@ -1339,32 +1354,31 @@ class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
 
         if self.categorical_transform_name.startswith("ordinal"):
             Xt = ct.fit_transform(X)
-            categorical_features = list(range(len(categorical_features)))
+            self._set_output_order(X.shape[1], categorical_features)
 
             self.random_mappings_ = {}
             if self.categorical_transform_name.endswith("_shuffled"):
-                for col_ix in categorical_features:
+                for col_ix in range(len(categorical_features)):
                     col_cats = len(
                         ct.named_transformers_["ordinal_encoder"].categories_[col_ix],
                     )
                     perm = rng.permutation(col_cats)
                     self.random_mappings_[col_ix] = perm
 
+                    # Mappings are applied on the pre-restore layout, where the
+                    # encoded columns occupy positions ``0..len(cat)-1``.
                     Xcol: np.ndarray = Xt[:, col_ix]  # type: ignore
                     not_nan_mask = ~np.isnan(Xcol)
                     Xcol[not_nan_mask] = perm[Xcol[not_nan_mask].astype(int)].astype(
                         Xcol.dtype,
                     )
 
+            Xt = _restore_column_order(Xt, out_order=self.output_order_)
+
         elif self.categorical_transform_name == "onehot":
-            Xt = ct.fit_transform(X)
-            if Xt.size >= 1_000_000:
-                ct = None
-                Xt = X
-            else:
-                categorical_features = list(range(Xt.shape[1]))[
-                    ct.output_indices_["one_hot_encoder"]
-                ]
+            raise NotImplementedError(
+                "One-hot encoding is not supported by the explainer pipeline.",
+            )
         else:
             raise ValueError(
                 f"Unknown categorical transform {self.categorical_transform_name}",
@@ -1401,7 +1415,7 @@ class EncodeCategoricalFeaturesStep(FeaturePreprocessingTransformerStep):
                 transformed[:, col][not_nan_mask] = mapping[
                     transformed[:, col][not_nan_mask].astype(int)
                 ].astype(transformed[:, col].dtype)
-        return transformed  # type: ignore
+        return _restore_column_order(transformed, out_order=self.output_order_)  # type: ignore
 
 
 class NanHandlingPolynomialFeaturesStep(FeaturePreprocessingTransformerStep):

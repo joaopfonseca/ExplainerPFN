@@ -471,6 +471,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
         outputs: list[torch.Tensor] = []
         borders: list[np.ndarray] = []
 
+        # Apply the same dtype/text handling used during ``fit``. This is the
+        # single funnel for ``predict``, ``predict_feature`` and ``finetune``.
+        X = self._prepare_predict_input(X)
+
         # Iterate over estimators
         for output, config in self.executor_[feature_idx].iter_outputs(
             X,
@@ -643,6 +647,18 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
         return logit_to_output(output_type=output_type)
 
+    def _prepare_predict_input(self, X: XType) -> np.ndarray:
+        """Apply the same dtype and text/NA handling used during ``fit``.
+
+        Fitting ordinal-encodes text/categorical columns. The same encoding
+        must be applied to the data passed to ``predict``/``get_embeddings``/
+        ``finetune``, otherwise the model receives raw strings or mismatched
+        dtypes.
+        """
+        X = _fix_dtypes(X, cat_indices=self.inferred_categorical_indices_)
+        X = _process_text_na_dataframe(X, ord_encoder=self.preprocessor_)
+        return X
+
     def predict(
         self,
         X: XType,
@@ -657,16 +673,17 @@ class ExplainerPFN:  # (TabPFNRegressor):
         ] = "mean",
         quantiles: list[float] | None = None,
     ):
+        check_is_fitted(self)
 
         # Check whether model is in inference mode
         for executor in self.executor_:
             if not executor.inference_mode:
                 executor.use_torch_inference_mode(True)
-                executor.model_.eval()
+                executor.model.eval()
 
         self.model_.eval()
 
-        if output_type in ["mean", "median", "mode", "quantiles"]:
+        if output_type in ["mean", "median", "mode"]:
             explanations = np.zeros(X.shape)
             for feature_idx in range(X.shape[1]):
                 explanations[:, feature_idx] = self.predict_feature(
@@ -676,6 +693,25 @@ class ExplainerPFN:  # (TabPFNRegressor):
                     output_type=output_type,
                     quantiles=quantiles,
                 )
+        elif output_type == "quantiles":
+            # ``predict_feature`` returns a list with one array per quantile.
+            # Stack across features so each quantile is an
+            # ``(n_samples, n_features)`` array.
+            per_feature = [
+                self.predict_feature(
+                    X,
+                    y,
+                    feature_idx=feature_idx,
+                    output_type=output_type,
+                    quantiles=quantiles,
+                )
+                for feature_idx in range(X.shape[1])
+            ]
+            n_quantiles = len(per_feature[0])
+            explanations = [
+                np.column_stack([per_feature[f][q] for f in range(X.shape[1])])
+                for q in range(n_quantiles)
+            ]
         elif output_type in ["full", "main"]:
             explanations = []
             for feature_idx in range(X.shape[1]):
@@ -688,20 +724,31 @@ class ExplainerPFN:  # (TabPFNRegressor):
                         quantiles=quantiles,
                     )
                 )
+        else:
+            raise ValueError(f"Invalid output type: {output_type}")
 
         return explanations
 
     def get_embeddings(self, X, y, feature_idx: int):
+        check_is_fitted(self)
+        X = self._prepare_predict_input(X)
 
         # Check whether model is in inference mode
         if not self.executor_[feature_idx].inference_mode:
             self.executor_[feature_idx].use_torch_inference_mode(True)
             self.model_.eval()
 
-        output = self.forward(
-            X, y, feature_idx=feature_idx, only_return_standard_out=True
-        )["test_embeddings"]
-        return output
+        embeddings = []
+        for output, _config in self.executor_[feature_idx].iter_outputs(
+            X,
+            y,
+            device=self.device_,
+            autocast=self.use_autocast_,
+            only_return_standard_out=False,
+        ):
+            embeddings.append(output["test_embeddings"])
+        # ``[n_estimators, n_samples, embedding_dim]``
+        return torch.stack(embeddings, dim=0)
 
     def save_foundation_model(self, path: Union[str, Path]):
         """
@@ -750,14 +797,22 @@ class ExplainerPFN:  # (TabPFNRegressor):
         return self
 
     def finetune(self, optimizer, X, y, shapley_values):
+        check_is_fitted(self)
 
         for executor in self.executor_:
             if executor.inference_mode:
                 # Set model to training mode and disable inference mode to allow backprop
                 executor.use_torch_inference_mode(False)
-                executor.model_.train()
+                executor.model.train()
 
         self.model_.train()
+
+        # A previous inference pass may have enabled memory-saving chunking,
+        # which is incompatible with backprop. Reset it before training.
+        self.model_.reset_save_peak_mem_factor(None)
+        # The trainset KV cache is an inference-only optimisation; disable it
+        # so gradients can flow through the transformer during fine-tuning.
+        self.model_.cache_trainset_representation = False
 
         # Zero gradients
         optimizer.zero_grad()

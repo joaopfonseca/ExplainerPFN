@@ -48,7 +48,7 @@ pip install -r requirements.txt
 ### Basic Usage
 
 ```python
-from explainerpfn.model import ExplainerPFN
+from explainerpfn.base import ExplainerPFN
 import numpy as np
 
 # Initialize the explainer
