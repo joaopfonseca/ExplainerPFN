@@ -93,3 +93,11 @@ notebooks/outputs/
 
 # Mypy cache
 .mypy_cache/
+
+# Training checkpoints, logs, and local venvs
+checkpoints/
+logs/
+*.ckp
+.venv/
+venv/
+

@@ -275,8 +275,15 @@ class TrainingBatchIterator:
             no-op at the default ranges but guards future config widening.
         num_samples: If set, deterministically subsample each dataset to at
             most this many rows. ``None`` (default) keeps all rows.
-        max_datasets: Optional cap on the number of datasets produced. ``None``
-            streams indefinitely.
+        max_datasets: Optional cap on the number of datasets produced *by this
+            iterator instance* (not an absolute index cap). ``None`` streams
+            indefinitely.
+        start_index: Index of the first dataset to generate. Because
+            :meth:`SyntheticDataGenerator.generate_one` seeds from the dataset
+            index alone, resuming from ``start_index=k`` reproduces exactly the
+            stream a fresh iterator would have produced from dataset ``k``
+            onward. Used by the training CLI to skip already-consumed datasets
+            after ``--resume``.
         device: Device used for the throwaway preprocessing fit.
         random_state: Seed for the optional per-batch subsampling.
     """
@@ -288,6 +295,7 @@ class TrainingBatchIterator:
         max_cells=70_000,
         num_samples=None,
         max_datasets=None,
+        start_index=0,
         device="cpu",
         random_state=None,
         verbose=False,
@@ -297,6 +305,7 @@ class TrainingBatchIterator:
         self.max_cells = max_cells
         self.num_samples = num_samples
         self.max_datasets = max_datasets
+        self.start_index = int(start_index)
         self.device = device
         self.random_state = random_state
         self.verbose = verbose
@@ -345,6 +354,10 @@ class TrainingBatchIterator:
             "shap": shap,
             "executor_configs": xai.executor_,
             "feature_exp_std": float(shap.std()),
+            # Provenance: lets the trainer persist the exact dataset index so a
+            # resumed run can skip the datasets it has already consumed.
+            "dataset_index": int(dataset["params"]["index"]),
+            "dataset_seed": int(dataset["params"]["seed"]),
         }
 
     # ------------------------------------------------------------------
@@ -352,10 +365,14 @@ class TrainingBatchIterator:
     # ------------------------------------------------------------------
 
     def _worker(self):
-        index = 0
+        index = self.start_index
+        produced_here = 0
         try:
             while not self._stop.is_set():
-                if self.max_datasets is not None and index >= self.max_datasets:
+                if (
+                    self.max_datasets is not None
+                    and produced_here >= self.max_datasets
+                ):
                     break
                 dataset = self.generator.generate_one(index)
                 n_cells = dataset["params"]["n_features"] * dataset["params"]["n_samples"]
@@ -364,6 +381,7 @@ class TrainingBatchIterator:
                     continue
                 batch = self._preprocess(dataset)
                 self._produced += 1
+                produced_here += 1
                 # Blocking put with stop-awareness.
                 while not self._stop.is_set():
                     try:
