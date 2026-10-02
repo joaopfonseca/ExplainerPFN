@@ -98,6 +98,42 @@ def test_no_root_count_above_high():
         assert 3 <= d <= 6
 
 
+# ── Sample-count range (inclusive, high = 5000) ───────────────────────
+
+
+def test_default_sample_range():
+    """The wrapper must default to 250-5000 rows (inclusive high)."""
+    assert SyntheticDataGenerator().n_samples_range == (250, 5000)
+
+
+def test_n_samples_range_inclusive_high():
+    """Both ends of a non-degenerate sample range must be reachable.
+
+    The wrapped generator samples rows in [low, high); the ``+1`` translation
+    in ``_make_generator`` must make ``high`` reachable while leaving a
+    degenerate (low == high) range exact.
+    """
+    gen = _small_gen(
+        n_samples_range=(4999, 5000),
+        linear_dag_prob=1.0,  # closed-form tier: cheap even at 5000 rows
+    )
+    seen = {gen.generate_one(i)["X"].shape[0] for i in range(8)}
+    assert seen == {4999, 5000}, f"expected both bounds, got {seen}"
+
+    # Degenerate range stays exact (no off-by-one from the +1 translation).
+    exact = _small_gen(n_samples_range=(250, 250), linear_dag_prob=1.0)
+    assert exact.generate_one(0)["X"].shape[0] == 250
+
+
+def test_iterator_max_cells_disabled_by_default():
+    """The dataset-size filter must be off unless explicitly enabled."""
+    it = TrainingBatchIterator(generator=_small_gen())
+    try:
+        assert it.max_cells is None
+    finally:
+        it.close()
+
+
 # ── Exact-label semantics ─────────────────────────────────────────────
 
 

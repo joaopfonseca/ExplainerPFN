@@ -31,7 +31,7 @@ TRAIN_ARGS=(
   --log-dir "logs"
   --num-epochs "100000"
   --num-batches "1"
-  --num-samples "1024"
+  --num-samples "5000"
   --lr "-1e-5"
   --weight-decay "1e-7"
   --max-grad-norm "1.0"

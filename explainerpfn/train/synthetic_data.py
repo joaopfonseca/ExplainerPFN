@@ -58,7 +58,7 @@ __all__ = ["SyntheticDataGenerator", "TrainingBatchIterator"]
 # premise that ExplainerPFN does not share.
 _DEFAULT_KWARGS = dict(
     n_features_range=(3, 15),  # inclusive
-    n_samples_range=(200, 1500),
+    n_samples_range=(250, 5000),  # inclusive
     n_dags_range=(1, 4),
     nodes_per_dag_range=(3, 8),
     edge_prob_range=(0.2, 0.4),
@@ -86,7 +86,10 @@ class SyntheticDataGenerator:
             root features. Capped at 15 by design (see module docstring).
             Internally translated to the wrapped generator's exclusive-high
             convention so ``high`` is actually reachable.
-        n_samples_range: ``(low, high)`` sample-count range.
+        n_samples_range: Inclusive ``(low, high)`` range for the number of
+            rows per dataset. Like ``n_features_range``, translated to the
+            wrapped generator's exclusive-high convention so ``high`` is
+            reachable.
         max_attempts: How many fresh seeds to try for a single dataset index
             before giving up. Needed because the topology generators can
             produce *more* root nodes than requested (the wrapped generator
@@ -101,7 +104,7 @@ class SyntheticDataGenerator:
     def __init__(
         self,
         n_features_range=(3, 15),
-        n_samples_range=(200, 1500),
+        n_samples_range=(250, 5000),
         max_attempts=100,
         random_state=None,
         verbose=False,
@@ -156,6 +159,14 @@ class SyntheticDataGenerator:
             kwargs["n_features_range"] = (low, low)
         else:
             kwargs["n_features_range"] = (low, high + 1)
+        # Same convention for rows: the wrapped generator samples n_samples in
+        # [low, high), so pass high + 1 to make `high` reachable; low == high
+        # stays exact.
+        s_low, s_high = self.n_samples_range
+        if s_low == s_high:
+            kwargs["n_samples_range"] = (s_low, s_high)
+        else:
+            kwargs["n_samples_range"] = (s_low, s_high + 1)
         return DAGGenerator(random_state=seed, **kwargs)
 
     # ------------------------------------------------------------------
@@ -271,8 +282,8 @@ class TrainingBatchIterator:
             one is constructed.
         prefetch: Number of batches buffered ahead of the consumer (>= 1).
         max_cells: Reject datasets whose ``n_samples * n_features`` reaches
-            this bound. Kept for parity with the legacy 70e3 filter; it is a
-            no-op at the default ranges but guards future config widening.
+            this bound. Disabled by default (``None``); set it to guard against
+            pathologically large datasets when widening the ranges.
         num_samples: If set, deterministically subsample each dataset to at
             most this many rows. ``None`` (default) keeps all rows.
         max_datasets: Optional cap on the number of datasets produced *by this
@@ -292,7 +303,7 @@ class TrainingBatchIterator:
         self,
         generator=None,
         prefetch=1,
-        max_cells=70_000,
+        max_cells=None,
         num_samples=None,
         max_datasets=None,
         start_index=0,

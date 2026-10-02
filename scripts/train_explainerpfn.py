@@ -211,7 +211,12 @@ def parse_args(argv=None):
     # Training
     p.add_argument("--num-epochs", type=int, default=100000)
     p.add_argument("--num-batches", type=int, default=1, help="Datasets per epoch.")
-    p.add_argument("--num-samples", type=int, default=1024, help="Rows kept per dataset.")
+    p.add_argument(
+        "--num-samples",
+        type=int,
+        default=5000,
+        help="Rows kept per dataset (subsample cap; smaller datasets are kept whole).",
+    )
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--weight-decay", type=float, default=1e-7)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
@@ -261,7 +266,13 @@ def parse_args(argv=None):
     # Data distribution (mirrors SyntheticDataGenerator / DAGGenerator)
     g = p.add_argument_group("data distribution")
     g.add_argument("--n-features-range", type=int, nargs=2, default=[3, 15])
-    g.add_argument("--n-samples-range", type=int, nargs=2, default=[200, 1500])
+    g.add_argument(
+        "--n-samples-range",
+        type=int,
+        nargs=2,
+        default=[250, 5000],
+        help="Rows per generated dataset, inclusive high.",
+    )
     g.add_argument("--n-dags-range", type=int, nargs=2, default=[1, 4])
     g.add_argument("--nodes-per-dag-range", type=int, nargs=2, default=[3, 8])
     g.add_argument("--edge-prob-range", type=float, nargs=2, default=[0.2, 0.4])
@@ -285,8 +296,9 @@ def parse_args(argv=None):
     g.add_argument(
         "--max-cells",
         type=int,
-        default=70_000,
-        help="Skip datasets whose n_samples * n_features reaches this bound.",
+        default=None,
+        help="Skip datasets whose n_samples * n_features reaches this bound "
+        "(disabled by default).",
     )
 
     args = p.parse_args(argv)
