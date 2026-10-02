@@ -25,14 +25,14 @@
 set -e
 
 TRAIN_ARGS=(
-  --model-path "~/ExplainerPFN/notebooks/tabpfn-v2-regressor.ckpt"
+  --model-path "$HOME/ExplainerPFN/notebooks/tabpfn-v2-regressor.ckpt"
   --device "auto"
   --save-dir "checkpoints"
   --log-dir "logs"
   --num-epochs "100000"
   --num-batches "1"
   --num-samples "5000"
-  --lr "-1e-5"
+  --lr "1e-5"
   --weight-decay "1e-7"
   --max-grad-norm "1.0"
   --save-freq "1000"
