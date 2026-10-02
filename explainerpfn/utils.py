@@ -1,6 +1,100 @@
-from typing import List
+"""Utility helpers for ExplainerPFN.
+
+Includes the explanation-correction functions, plus the training-time
+checkpoint I/O helpers (``_retry_io``, ``find_latest_checkpoint``) that make
+saves robust on flaky cluster filesystems and power ``--auto-resume``. The
+latter mirror the DiffusionExplainerPFN training utilities.
+"""
+
+import functools
+import glob
+import os
+import re
+import time
+from typing import Callable, Optional, TypeVar
+
 import numpy as np
 from sklearn.linear_model import LinearRegression
+
+F = TypeVar("F", bound=Callable[..., object])
+
+
+def _retry_io(
+    max_retries: int = 4,
+    base_delay: float = 1.0,
+    backoff: float = 2.0,
+) -> Callable[[F], F]:
+    """Retry a file-writing function on transient ``OSError``/``IOError``.
+
+    Cluster/NFS mounts intermittently raise EIO, ENOSPC, EAGAIN, or broken
+    pipes during writes; retrying with exponential backoff keeps a long
+    training run alive instead of crashing mid-save. Non-filesystem exceptions
+    propagate immediately. Each retry is announced with an ``[io-retry]`` prefix.
+
+    Args:
+        max_retries: Extra attempts after the first failure (total calls =
+            ``max_retries + 1``).
+        base_delay: Seconds before the first retry.
+        backoff: Multiplier applied to the delay after each retry.
+    """
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            delay = base_delay
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except (OSError, IOError) as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        print(
+                            f"[io-retry] {func.__name__} failed after "
+                            f"{max_retries + 1} attempts; giving up: {exc!r}",
+                            flush=True,
+                        )
+                        raise
+                    print(
+                        f"[io-retry] {func.__name__} failed "
+                        f"(attempt {attempt}/{max_retries + 1}): {exc!r}; "
+                        f"retrying in {delay:.1f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    delay *= backoff
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+def find_latest_checkpoint(save_dir: Optional[str]) -> Optional[str]:
+    """Return the highest-step ``checkpoint_*.pt`` in ``save_dir``, else ``None``.
+
+    ``final_model.pt`` is ignored: it is the artifact of a completed run, not a
+    periodic resume point. Missing/empty directories also return ``None`` so
+    ``--auto-resume`` can fall back to a fresh start.
+    """
+    if save_dir is None or not os.path.isdir(save_dir):
+        return None
+
+    candidates = glob.glob(os.path.join(save_dir, "checkpoint_*.pt"))
+    if not candidates:
+        return None
+
+    step_re = re.compile(r"checkpoint_(\d+)\.pt$")
+    best_step = -1
+    best_path: Optional[str] = None
+    for path in candidates:
+        m = step_re.search(os.path.basename(path))
+        if m is None:
+            continue
+        step = int(m.group(1))
+        if step > best_step:
+            best_step = step
+            best_path = path
+    return best_path
 
 
 def scores_to_ranking(y, direction=-1):

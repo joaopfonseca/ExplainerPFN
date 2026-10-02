@@ -208,7 +208,15 @@ def test_iterator_batch_contract():
     finally:
         it.close()
 
-    assert set(batch) == {"X", "y", "shap", "executor_configs", "feature_exp_std"}
+    assert set(batch) == {
+        "X",
+        "y",
+        "shap",
+        "executor_configs",
+        "feature_exp_std",
+        "dataset_index",
+        "dataset_seed",
+    }
     n_samples, n_features = batch["X"].shape
     assert batch["y"].shape == (n_samples,)
     assert batch["shap"].shape == (n_samples, n_features)
@@ -216,6 +224,36 @@ def test_iterator_batch_contract():
     assert np.isfinite(batch["feature_exp_std"]) and batch["feature_exp_std"] > 0
     assert np.all(np.isfinite(batch["X"]))
     assert np.all(np.isfinite(batch["shap"]))
+    assert batch["dataset_index"] == 0
+
+
+def test_iterator_start_index_resumes_stream():
+    """``start_index=k`` must reproduce the k-th dataset of a fresh stream.
+
+    This is the invariant the training CLI relies on: after ``--resume`` it
+    rebuilds the iterator with ``start_index=<consumed>`` and expects the same
+    data it would have generated contiguously.
+    """
+    gen_full = _small_gen(linear_dag_prob=1.0, n_samples_range=(60, 60))
+    full = TrainingBatchIterator(generator=gen_full, max_datasets=3, prefetch=1)
+    try:
+        datasets = [full.next_batch() for _ in range(3)]
+    finally:
+        full.close()
+
+    # A stream that starts at dataset 2 must equal the third full batch.
+    gen_resumed = _small_gen(linear_dag_prob=1.0, n_samples_range=(60, 60))
+    resumed = TrainingBatchIterator(
+        generator=gen_resumed, max_datasets=1, start_index=2, prefetch=1
+    )
+    try:
+        batch = resumed.next_batch()
+    finally:
+        resumed.close()
+
+    assert batch["dataset_index"] == 2
+    np.testing.assert_array_equal(batch["X"], datasets[2]["X"])
+    np.testing.assert_array_equal(batch["shap"], datasets[2]["shap"])
 
 
 def test_iterator_streams_multiple_batches_threaded():
