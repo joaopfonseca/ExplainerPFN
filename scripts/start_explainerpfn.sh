@@ -25,7 +25,7 @@
 set -e
 
 TRAIN_ARGS=(
-  --model-path "auto"
+  --model-path "~/ExplainerPFN/notebooks/tabpfn-v2-regressor.ckpt"
   --device "auto"
   --save-dir "checkpoints"
   --log-dir "logs"

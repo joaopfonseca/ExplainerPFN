@@ -1,7 +1,7 @@
 """Train ExplainerPFN on online exact-do-Shapley synthetic data.
 
-Python port of ``notebooks/6-train-explainerpfn.ipynb``, hardened for
-cluster use. It keeps the notebook's training contract unchanged:
+Python port of ``notebooks/6-train-explainerpfn.ipynb``.
+It keeps the notebook's training contract unchanged:
 
   * data is generated online by :class:`TrainingBatchIterator` (no pickle
     files), each batch carrying ``X, y, shap, executor_configs,
