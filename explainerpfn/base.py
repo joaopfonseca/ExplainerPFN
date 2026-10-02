@@ -12,7 +12,6 @@ from torch.types import _dtype
 from sklearn import config_context
 from sklearn.base import TransformerMixin, check_is_fitted
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer
 
 
 # from tabpfn import TabPFNRegressor
@@ -654,7 +653,16 @@ class ExplainerPFN:  # (TabPFNRegressor):
         must be applied to the data passed to ``predict``/``get_embeddings``/
         ``finetune``, otherwise the model receives raw strings or mismatched
         dtypes.
+
+        When this instance was not fitted itself but borrows pre-fitted
+        ``executor_`` objects (the notebook 6 training-loop pattern, where the
+        executors come from a throwaway ``ExplainerPFN.fit`` call), the
+        fit-time encoding attributes are absent. The executors were built from
+        already-encoded data, so the numeric query features only need a dtype
+        coercion.
         """
+        if not hasattr(self, "inferred_categorical_indices_"):
+            return np.asarray(X, dtype=np.float64)
         X = _fix_dtypes(X, cat_indices=self.inferred_categorical_indices_)
         X = _process_text_na_dataframe(X, ord_encoder=self.preprocessor_)
         return X
