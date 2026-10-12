@@ -99,7 +99,12 @@ def initialize_explainerpfn_model(
     """Initializes a TabPFN model based on the provided configuration.
 
     Args:
-        model_path: Path or directive ("auto") to load the pre-trained model from.
+        model_path: Path or directive ("auto") to load the pre-trained model
+            from. Trainer checkpoints written by
+            ``scripts/train_explainerpfn.py`` (``checkpoint_*.pt``) are also
+            accepted: only the model weights are used, with the bar
+            distribution and architecture config taken from the foundation
+            model the run was fine-tuned from.
         which: Which TabPFN model to load.
         fit_mode: Determines caching behavior.
 

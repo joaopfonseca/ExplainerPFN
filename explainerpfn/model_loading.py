@@ -30,9 +30,116 @@ ArchitectureConfig: TypeAlias = (
 )
 
 
+def _reconstitute_foundation_checkpoint(
+    trainer_checkpoint: dict,
+    reference_checkpoint: dict,
+    *,
+    source_path: str | Path,
+    reference_path: str | Path,
+) -> dict:
+    """Build a foundation-format payload from a trainer checkpoint.
+
+    Trainer checkpoints (``scripts/train_explainerpfn.py``) store the
+    fine-tuned weights under ``model_state_dict`` but neither the
+    bar-distribution (``criterion.*``) state nor the architecture config.
+    Both are training-invariant -- the trainer's optimizer only ever held
+    ``model_.parameters()`` -- so they are sourced from
+    ``reference_checkpoint``, the foundation checkpoint the run was
+    fine-tuned from.
+    """
+    model_state = trainer_checkpoint["model_state_dict"]
+    reference_state = reference_checkpoint["state_dict"]
+
+    unknown = set(model_state) - set(reference_state)
+    if unknown:
+        raise ValueError(
+            f"Trainer checkpoint {source_path} has tensor keys that are "
+            f"absent from the reference foundation checkpoint "
+            f"{reference_path}: {sorted(unknown)[:5]}. The reference is "
+            "probably not the model this checkpoint was fine-tuned from."
+        )
+    for key, tensor in model_state.items():
+        reference_tensor = reference_state[key]
+        if (
+            torch.is_tensor(tensor)
+            and torch.is_tensor(reference_tensor)
+            and tensor.shape != reference_tensor.shape
+        ):
+            raise ValueError(
+                f"Shape mismatch for '{key}' between trainer checkpoint "
+                f"{source_path} ({tuple(tensor.shape)}) and reference "
+                f"checkpoint {reference_path} "
+                f"({tuple(reference_tensor.shape)})."
+            )
+
+    logger.info(
+        f"Trainer checkpoint {source_path} (epoch "
+        f"{trainer_checkpoint.get('epoch', '?')}): using its model weights, "
+        f"with criterion and architecture config from {reference_path}. "
+        "Optimizer, scheduler and RNG state are ignored (to resume training, "
+        "use scripts/train_explainerpfn.py --resume)."
+    )
+    return {
+        "state_dict": {**reference_state, **model_state},
+        "config": reference_checkpoint["config"],
+    }
+
+
+def _resolve_foundation_reference(
+    trainer_checkpoint: dict,
+    *,
+    which: Literal["regressor", "classifier"],
+    version: str,
+    download: bool,
+) -> Path:
+    """Find a foundation-format reference for a trainer checkpoint.
+
+    Preference order: the foundation model the run was fine-tuned from, as
+    recorded in the trainer checkpoint's saved arguments
+    (``config["model_path"]``), if it exists on this machine; otherwise the
+    default stock TabPFN checkpoint (downloaded once if necessary).
+    """
+    config = trainer_checkpoint.get("config")
+    if isinstance(config, dict):
+        recorded = config.get("model_path")
+        if isinstance(recorded, (str, Path)) and Path(recorded).exists():
+            return Path(recorded)
+
+    model_path, model_dir, model_name, _ = resolve_model_path(
+        None, which, version
+    )
+    model_dir.mkdir(parents=True, exist_ok=True)
+    if not model_path.exists():
+        if not download:
+            raise ValueError(
+                "A foundation reference is required to load a trainer "
+                "checkpoint, the default model path does not exist, and "
+                f"downloading is disabled\nmodel path: {model_path}"
+            )
+        logger.info(f"Downloading foundation reference model to {model_path}.")
+        res = download_model(
+            model_path,
+            version=version,
+            which=cast("Literal['classifier', 'regressor']", which),
+            model_name=model_name,
+        )
+        if res != "ok":
+            raise RuntimeError(
+                f"Failed to download the foundation reference model to "
+                f"{model_path}! Trainer checkpoints need the stock model "
+                "the run was fine-tuned from. Place a foundation-format "
+                "checkpoint (a .ckp file) at the trainer checkpoint's "
+                "recorded 'model_path', or at the default model path."
+            ) from res[0]
+    return model_path
+
+
 def load_model(
     *,
     path: Path,
+    which: Literal["regressor", "classifier"] = "regressor",
+    version: str = "v2",
+    download: bool = True,
 ) -> tuple[
     nn.Module,
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
@@ -40,8 +147,22 @@ def load_model(
 ]:
     """Loads a model from a given path. Only for inference.
 
+    Both checkpoint formats written by this project are accepted: foundation
+    checkpoints (``{"state_dict", "config"}`` -- the stock TabPFN models or
+    ``*.ckp`` files written by ``save_foundation_model``) and trainer
+    checkpoints from ``scripts/train_explainerpfn.py`` (recognized by their
+    ``model_state_dict`` key). For trainer checkpoints only the model weights
+    are used; the bar distribution and architecture config are taken from the
+    foundation checkpoint the run was fine-tuned from.
+
     Args:
         path: Path to the checkpoint
+        which: Which stock model to fetch as the foundation reference when
+            ``path`` is a trainer checkpoint whose recorded reference is not
+            available on this machine.
+        version: The version of the stock reference model.
+        download: Whether the stock reference model may be downloaded if
+            missing.
     """
     # TODO: See below.
     # Catch the `FutureWarning` that torch raises. This should be dealt with!
@@ -53,6 +174,41 @@ def load_model(
     #     warnings.simplefilter("ignore", category=FutureWarning)
     #     checkpoint = torch.load(path, map_location="cpu", weights_only=None)
     checkpoint = torch.load(path, map_location="cpu", weights_only=None)
+
+    if (
+        isinstance(checkpoint, dict)
+        and "state_dict" not in checkpoint
+        and "model_state_dict" in checkpoint
+    ):
+        reference_path = _resolve_foundation_reference(
+            checkpoint, which=which, version=version, download=download
+        )
+        reference = torch.load(
+            reference_path, map_location="cpu", weights_only=None
+        )
+        checkpoint = _reconstitute_foundation_checkpoint(
+            checkpoint,
+            reference,
+            source_path=path,
+            reference_path=reference_path,
+        )
+
+    if (
+        not isinstance(checkpoint, dict)
+        or "state_dict" not in checkpoint
+        or "config" not in checkpoint
+    ):
+        found = (
+            sorted(checkpoint.keys())
+            if isinstance(checkpoint, dict)
+            else type(checkpoint).__name__
+        )
+        raise ValueError(
+            f"Checkpoint {path} matches neither supported format: expected a "
+            "foundation checkpoint with keys 'state_dict' and 'config', or a "
+            "trainer checkpoint from scripts/train_explainerpfn.py with key "
+            f"'model_state_dict'. Found: {found}."
+        )
 
     state_dict = checkpoint["state_dict"]
     config, unused_config = parse_config(checkpoint["config"])
@@ -141,7 +297,9 @@ def load_model_criterion_config(
                 f"Then place it at: {model_path}",
             ) from res[0]
 
-    loaded_model, criterion, config = load_model(path=model_path)
+    loaded_model, criterion, config = load_model(
+        path=model_path, which=which, version=version, download=download
+    )
     loaded_model.cache_trainset_representation = cache_trainset_representation
     if check_bar_distribution_criterion and not isinstance(
         criterion,
