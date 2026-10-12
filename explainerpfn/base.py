@@ -1,3 +1,4 @@
+import logging
 import typing
 from typing import Any, List, Literal, Union
 from typing_extensions import TypeAlias, TypedDict
@@ -49,6 +50,9 @@ from explainerpfn.utils import (
     multiplicative_correction,
     statistical_correction,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 XType: TypeAlias = Any
@@ -109,7 +113,10 @@ def initialize_explainerpfn_model(
             ``scripts/train_explainerpfn.py`` (``checkpoint_*.pt``) are also
             accepted: only the model weights are used, with the bar
             distribution and architecture config taken from the foundation
-            model the run was fine-tuned from.
+            model the run was fine-tuned from. If the checkpoint carries a
+            joint attribution head (top-level ``head_state_dict``/
+            ``head_config``), it is loaded automatically during ``fit`` and
+            ``predict`` then defaults to ``mode="joint"``.
         which: Which TabPFN model to load.
         fit_mode: Determines caching behavior.
 
@@ -419,8 +426,23 @@ class ExplainerPFN:  # (TabPFNRegressor):
             inplace=True,
             differentiable_input=False,
         )
-        if self.joint_head and self.head_ is None:
-            self.initialize_attribution_head()
+        if self.head_ is None:
+            loaded_head = False
+            if isinstance(self.model_path, (str, Path)) and Path(
+                self.model_path
+            ).is_file():
+                # A checkpoint may carry a joint attribution head (trainer
+                # ``.pt`` files and ``*.ckp`` files saved with an embedded head
+                # both store top-level ``head_state_dict``/``head_config``).
+                # Load it from its saved config/weights; otherwise fall back to
+                # a freshly initialized head when ``joint_head=True``.
+                loaded_head = self.load_attribution_head(self.model_path)
+                if loaded_head:
+                    logger.info(
+                        "Loaded attribution head from %s", self.model_path
+                    )
+            if not loaded_head and self.joint_head:
+                self.initialize_attribution_head()
         return byte_size, rng
 
     # ------------------------------------------------------------------
@@ -498,8 +520,9 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """All-features attribution predictions from the joint head."""
         if self.head_ is None:
             raise ValueError(
-                "predict(mode='joint') requires an AttributionHead; construct "
-                "the estimator with joint_head=True."
+                "predict(mode='joint') requires an AttributionHead; load a "
+                "checkpoint containing 'head_state_dict' (via model_path) or "
+                "construct the estimator with joint_head=True."
             )
         if self.n_estimators != 1:
             raise ValueError(
@@ -890,9 +913,14 @@ class ExplainerPFN:  # (TabPFNRegressor):
             "main",
         ] = "mean",
         quantiles: list[float] | None = None,
-        mode: Literal["per-feature", "joint"] = "per-feature",
+        mode: Literal["per-feature", "joint"] | None = None,
     ):
         check_is_fitted(self)
+
+        if mode is None:
+            # A loaded/constructed joint head makes joint the natural default;
+            # estimators without a head keep the historical per-feature output.
+            mode = "joint" if self.head_ is not None else "per-feature"
 
         if mode == "joint":
             return self._predict_joint(
@@ -980,10 +1008,16 @@ class ExplainerPFN:  # (TabPFNRegressor):
         """
         Save the underlying model to the specified path.
 
-        This writes only the base pre-trained weights and configuration. It does
+        This writes the base pre-trained weights and configuration. It does
         **not** store a fitted :class:`TabPFNRegressor`/``Classifier`` instance.
         The resulting file is merely a checkpoint consumed by
         :func:`load_model_criterion_config` to build a new estimator.
+
+        When a joint attribution head is present on this estimator, its weights
+        and config are embedded as additive ``head_state_dict``/``head_config``
+        keys. These are ignored by older loaders, and are picked up
+        automatically by :meth:`load_attribution_head` (and hence by
+        ``ExplainerPFN(model_path=...)``) so the file is self-contained.
 
         Args:
             model:
@@ -1016,6 +1050,13 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
         # Create checkpoint with correct structure
         checkpoint = {"state_dict": state_dict, "config": asdict(self.config_)}
+
+        # Optionally embed the joint attribution head. These keys are additive:
+        # ``load_model`` only requires ``state_dict``/``config`` and ignores
+        # unknown keys, so foundation checkpoints stay backward-compatible.
+        if self.head_ is not None:
+            checkpoint["head_state_dict"] = self.head_state_dict()
+            checkpoint["head_config"] = self.head_config_
 
         # Save the checkpoint
         torch.save(checkpoint, path)

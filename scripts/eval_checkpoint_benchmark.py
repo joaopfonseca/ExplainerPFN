@@ -140,12 +140,9 @@ def main():
                     inference_precision=inference_precision,
                 )
                 xai.fit(X_fit, y_fit)
-                if args.mode == "joint":
-                    if not xai.load_attribution_head(model_path):
-                        raise ValueError(
-                            f"{model_path} has no head_state_dict; cannot "
-                            "run --mode joint."
-                        )
+                # A joint head embedded in the checkpoint is auto-loaded by
+                # ``fit``; ``--mode joint`` on a headless checkpoint raises a
+                # clear error from ``predict``.
                 exp = xai.predict(X_test, y_test, mode=args.mode)
                 corrected = xai.apply_correction(
                     y_test, exp, kind=["statistical", "additive"]
