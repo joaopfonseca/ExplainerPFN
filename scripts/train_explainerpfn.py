@@ -55,6 +55,10 @@ from torch import optim
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from explainerpfn.base import ExplainerPFN  # noqa: E402
+from explainerpfn.model.attribution_head import (  # noqa: E402
+    bucket_means,
+    efficiency_penalty,
+)
 from explainerpfn.train.synthetic_data import (  # noqa: E402
     SyntheticDataGenerator,
     TrainingBatchIterator,
@@ -142,6 +146,9 @@ def save_checkpoint(
         "rng_state": rng.bit_generator.state,
         "config": vars(args),
     }
+    if getattr(xai, "head_", None) is not None:
+        payload["head_state_dict"] = xai.head_state_dict()
+        payload["head_config"] = xai.head_config_
     _atomic_torch_save(path, payload)
     logger(f"Saved checkpoint: {path} (epoch {epoch}, data index {data_start_index})")
 
@@ -165,6 +172,17 @@ def load_checkpoint(path, xai, optimizer, device, logger):
                     state[k] = v.to(device)
     else:
         logger("WARNING: checkpoint has no optimizer state; optimizer starts fresh.")
+
+    if checkpoint.get("head_state_dict") is not None:
+        if getattr(xai, "head_", None) is None:
+            logger(
+                "WARNING: checkpoint contains an attribution head but this run "
+                "was started without --joint-head; head state ignored."
+            )
+        else:
+            xai.head_.load_state_dict(checkpoint["head_state_dict"])
+            xai.head_.to(device)
+            logger("Loaded attribution head state from checkpoint.")
 
     # The LR scheduler state is deliberately NOT restored: its ``T_max`` was
     # the *old* target, and a resume may legitimately extend training. The
@@ -301,6 +319,43 @@ def parse_args(argv=None):
         "(disabled by default).",
     )
 
+    # Joint attribution head
+    j = p.add_argument_group("joint attribution head")
+    j.add_argument(
+        "--joint-head",
+        action="store_true",
+        default=False,
+        help="Train the joint multi-attribution head alongside the backbone.",
+    )
+    j.add_argument(
+        "--efficiency-weight",
+        type=float,
+        default=0.1,
+        help="Weight of the efficiency penalty "
+        "(sum_j phi_j - (f(x) - base))^2.",
+    )
+    j.add_argument(
+        "--head-lr",
+        type=float,
+        default=None,
+        help="Learning rate for the head. Defaults to --lr.",
+    )
+    j.add_argument("--head-n-buckets", type=int, default=256)
+    j.add_argument(
+        "--head-hidden-dim",
+        type=int,
+        default=None,
+        help="Internal width of the slot mixer (default: backbone embedding size).",
+    )
+    j.add_argument("--head-n-layers", type=int, default=2)
+    j.add_argument("--head-nhead", type=int, default=6)
+    j.add_argument(
+        "--head-max-features",
+        type=int,
+        default=None,
+        help="Largest number of feature slots (default: n_features_range[1]).",
+    )
+
     args = p.parse_args(argv)
 
     # Normalise tuple-like args and record the exact resume-relevant data config.
@@ -367,17 +422,50 @@ def train(args, logger):
         )
 
     # Model + optimizer + scheduler (same construction as notebook 6).
+    head_kwargs = {
+        "n_buckets": args.head_n_buckets,
+        "hidden_dim": args.head_hidden_dim,
+        "n_layers": args.head_n_layers,
+        "nhead": args.head_nhead,
+        "max_features": args.head_max_features or args.n_features_range[1],
+    }
     xai = ExplainerPFN(
         fit_mode="low_memory",
         model_path=args.model_path,
         random_state=args.seed,
         device=device,
+        joint_head=args.joint_head,
+        head_kwargs=head_kwargs,
     )
     xai._initialize_model_variables()
     xai.model_.train()
 
+    head_lr = args.head_lr if args.head_lr is not None else args.lr
+    param_groups = [
+        {
+            "params": list(xai.model_.parameters()),
+            "lr": args.lr,
+            "initial_lr": args.lr,
+            "name": "backbone",
+        }
+    ]
+    trainable_params = list(xai.model_.parameters())
+    if xai.head_ is not None:
+        xai.head_.train()
+        n_head_params = sum(p.numel() for p in xai.head_.parameters())
+        logger(f"Joint attribution head: {n_head_params} params, lr={head_lr}")
+        param_groups.append(
+            {
+                "params": list(xai.head_.parameters()),
+                "lr": head_lr,
+                "initial_lr": head_lr,
+                "name": "head",
+            }
+        )
+        trainable_params += list(xai.head_.parameters())
+
     optimizer = optim.Adam(
-        xai.model_.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        param_groups, lr=args.lr, weight_decay=args.weight_decay
     )
 
     rng = np.random.default_rng(args.seed)
@@ -413,11 +501,12 @@ def train(args, logger):
             rng.bit_generator.state = resume_state["rng_state"]
             logger("Restored RNG state from checkpoint.")
         # ``optimizer.load_state_dict`` restores the checkpoint's *old* LR into
-        # the param groups, which would desync the scheduler. Reset the base LR
-        # so the freshly-built scheduler below starts from ``--lr``.
+        # the param groups, which would desync the scheduler. Reset each group
+        # to its own base LR so the freshly-built scheduler anneals correctly.
         for group in optimizer.param_groups:
-            group["lr"] = args.lr
-            group["initial_lr"] = args.lr
+            base_lr = group.get("initial_lr", args.lr)
+            group["lr"] = base_lr
+            group["initial_lr"] = base_lr
 
     # Scheduler is built AFTER resume so its base LR is ``--lr`` and its T_max
     # is the (possibly extended) ``--num-epochs`` target.
@@ -453,6 +542,8 @@ def train(args, logger):
         for epoch in epoch_iter:
             optimizer.zero_grad()
             epoch_losses = []
+            epoch_head_losses = []
+            epoch_eff_losses = []
             last_dataset_index = data_start_index
 
             for _ in range(args.num_batches):
@@ -466,19 +557,26 @@ def train(args, logger):
                 executor_configs = batch["executor_configs"]
 
                 batch_loss = 0.0
+                feature_embeddings = []
                 for feature_idx in range(X_batch.shape[1]):
                     xai.executor_ = executor_configs
                     xai.executor_[feature_idx].model = xai.model_
                     xai.executor_[feature_idx].use_torch_inference_mode(False)
 
                     with torch.enable_grad():
-                        feature_logits, outputs, borders = xai.forward(
-                            X_batch,
-                            y_batch,
-                            feature_idx=feature_idx,
-                            only_return_standard_out=True,
-                        )
-                        del outputs, borders  # borders is a numpy array
+                        if xai.head_ is not None:
+                            feature_logits, emb = xai.forward_with_embeddings(
+                                X_batch, y_batch, feature_idx
+                            )
+                            feature_embeddings.append(emb)
+                        else:
+                            feature_logits, outputs, borders = xai.forward(
+                                X_batch,
+                                y_batch,
+                                feature_idx=feature_idx,
+                                only_return_standard_out=True,
+                            )
+                            del outputs, borders  # borders is a numpy array
 
                     target_shap = torch.tensor(
                         shap_batch[:, feature_idx] / batch["feature_exp_std"],
@@ -492,6 +590,43 @@ def train(args, logger):
                     batch_loss = batch_loss + feature_loss
 
                 batch_loss = batch_loss / X_batch.shape[1]
+
+                if xai.head_ is not None:
+                    embeddings = torch.stack(feature_embeddings, dim=1)
+                    features_t = torch.tensor(
+                        X_batch, dtype=torch.float32, device=xai.device_
+                    )
+                    score_t = torch.tensor(
+                        y_batch, dtype=torch.float32, device=xai.device_
+                    )
+                    head_logits = xai.head_(embeddings, features_t, score_t)
+                    n_s, n_f, n_b = head_logits.shape
+                    flat = head_logits.reshape(n_s * n_f, n_b)
+                    target_flat = torch.tensor(
+                        shap_batch / batch["feature_exp_std"],
+                        dtype=torch.float32,
+                        device=xai.device_,
+                    ).reshape(-1)
+                    head_loss = xai.head_criterion_(
+                        flat.cpu(), target_flat.cpu()
+                    ).mean()
+                    means = bucket_means(
+                        flat, xai.head_centers_.to(flat.device)
+                    ).reshape(n_s, n_f)
+                    # The exact do-Shapley labels satisfy sum_j phi_j = f(x) -
+                    # base_value, so their row sums are the efficiency target.
+                    target_sum = torch.tensor(
+                        shap_batch.sum(axis=1) / batch["feature_exp_std"],
+                        dtype=torch.float32,
+                        device=xai.device_,
+                    )
+                    eff_loss = efficiency_penalty(means, target_sum)
+                    batch_loss = (
+                        batch_loss + head_loss + args.efficiency_weight * eff_loss
+                    )
+                    epoch_head_losses.append(float(head_loss.item()))
+                    epoch_eff_losses.append(float(eff_loss.item()))
+
                 epoch_losses.append(batch_loss)
 
             total_loss = torch.stack(epoch_losses).mean()
@@ -502,12 +637,12 @@ def train(args, logger):
             gc.collect()
 
             total_grad_norm = 0.0
-            for prm in xai.model_.parameters():
+            for prm in trainable_params:
                 if prm.grad is not None:
                     total_grad_norm += prm.grad.norm().item() ** 2
             total_grad_norm = total_grad_norm**0.5
 
-            torch.nn.utils.clip_grad_norm_(xai.model_.parameters(), args.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
@@ -522,6 +657,11 @@ def train(args, logger):
                     f"Epoch {epoch}, Loss: {total_loss.item():.3f}, "
                     f"Grad Norm: {total_grad_norm:.3f}, LR: {current_lr:.2e}"
                 )
+                if epoch_head_losses:
+                    msg += (
+                        f", Head Loss: {np.mean(epoch_head_losses):.3f}"
+                        f", Eff: {np.mean(epoch_eff_losses):.4f}"
+                    )
                 if device.type == "cuda":
                     free, total = torch.cuda.mem_get_info()
                     msg += f", Free Mem: {free / 1024**2:.1f}MB"

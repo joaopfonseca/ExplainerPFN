@@ -37,6 +37,11 @@ from tabpfn.utils import (
 from explainerpfn.config import ModelInterfaceConfig
 
 from explainerpfn.inference import InferenceEngineCachePreprocessing
+from explainerpfn.model.attribution_head import (
+    AttributionHead,
+    bucket_means,
+    downsample_borders,
+)
 from explainerpfn.model_loading import load_model_criterion_config
 from explainerpfn.utils import (
     linear_correction,
@@ -250,6 +255,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
         memory_saving_mode: bool | Literal["auto"] | float | int = "auto",
         random_state=None,
         n_jobs: int = -1,
+        joint_head: bool = False,
+        head_kwargs: dict | None = None,
     ):
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -261,6 +268,14 @@ class ExplainerPFN:  # (TabPFNRegressor):
         self.memory_saving_mode = memory_saving_mode
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.joint_head = joint_head
+        self.head_kwargs = dict(head_kwargs or {})
+        # Populated by ``initialize_attribution_head`` / ``_initialize_model_variables``.
+        self.head_ = None
+        self.head_config_ = None
+        self.head_borders_ = None
+        self.head_centers_ = None
+        self.head_criterion_ = None
 
     def _initialize_dataset_preprocessing(
         self, X: XType, y: YType, rng: np.random.Generator
@@ -404,7 +419,131 @@ class ExplainerPFN:  # (TabPFNRegressor):
             inplace=True,
             differentiable_input=False,
         )
+        if self.joint_head and self.head_ is None:
+            self.initialize_attribution_head()
         return byte_size, rng
+
+    # ------------------------------------------------------------------
+    # Joint attribution head
+    # ------------------------------------------------------------------
+
+    def initialize_attribution_head(self, head_config: dict | None = None):
+        """Construct the joint :class:`AttributionHead` (and its criterion).
+
+        Args:
+            head_config: Optional constructor kwargs; merged over
+                ``self.head_kwargs``. ``emb_dim`` defaults to the backbone
+                embedding size.
+        """
+        kwargs = dict(self.head_kwargs)
+        if head_config is not None:
+            kwargs = {**kwargs, **head_config}
+        kwargs.setdefault("emb_dim", self.config_.emsize)
+        kwargs.setdefault("n_buckets", 256)
+        kwargs.setdefault("max_features", 15)
+        self.head_ = AttributionHead(**kwargs)
+        self.head_config_ = self.head_.config()
+
+        borders = downsample_borders(
+            self.bardist_.borders, self.head_.n_buckets
+        ).to(torch.float32)
+        self.head_borders_ = borders
+        self.head_centers_ = (borders[:-1] + borders[1:]) / 2.0
+        self.head_criterion_ = FullSupportBarDistribution(borders)
+        self.head_.to(self.device_)
+        return self.head_
+
+    def load_attribution_head(self, checkpoint_path) -> bool:
+        """Load the head from a trainer checkpoint (``head_state_dict``).
+
+        Returns:
+            True if a head was found and loaded, False otherwise.
+        """
+        checkpoint = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+        if not isinstance(checkpoint, dict) or "head_state_dict" not in checkpoint:
+            return False
+        self.initialize_attribution_head(checkpoint.get("head_config"))
+        self.head_.load_state_dict(checkpoint["head_state_dict"])
+        self.head_.to(self.device_)
+        return True
+
+    def head_state_dict(self):
+        """Backbone-independent head state for checkpointing."""
+        if self.head_ is None:
+            return None
+        return self.head_.state_dict()
+
+    def _collect_feature_embeddings(self, X, y) -> torch.Tensor:
+        """Per-feature backbone ``test_embeddings`` as ``(n, d, emb)``."""
+        embeddings = []
+        for feature_idx in range(self.n_features_in_):
+            output = self.forward(
+                X, y, feature_idx=feature_idx, only_return_standard_out=False
+            )
+            test_embeddings = output["test_embeddings"]
+            if test_embeddings.ndim == 3:
+                test_embeddings = test_embeddings[:, 0, :]
+            embeddings.append(test_embeddings)
+        return torch.stack(embeddings, dim=1)
+
+    def _predict_joint(
+        self,
+        X,
+        y,
+        output_type: str = "mean",
+        quantiles: list[float] | None = None,
+    ):
+        """All-features attribution predictions from the joint head."""
+        if self.head_ is None:
+            raise ValueError(
+                "predict(mode='joint') requires an AttributionHead; construct "
+                "the estimator with joint_head=True."
+            )
+        if self.n_estimators != 1:
+            raise ValueError(
+                "joint mode supports a single estimator (n_estimators=1); got "
+                f"{self.n_estimators}."
+            )
+        if quantiles is None:
+            quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+        embeddings = self._collect_feature_embeddings(X, y)
+        features = np.asarray(
+            self._prepare_predict_input(X), dtype=np.float32
+        )
+        score = np.asarray(y, dtype=np.float32).reshape(-1)
+        features_t = torch.as_tensor(
+            features, dtype=torch.float32, device=self.device_
+        )
+        score_t = torch.as_tensor(
+            score, dtype=torch.float32, device=self.device_
+        )
+        with torch.inference_mode():
+            logits = self.head_(embeddings, features_t, score_t)  # (n, d, K)
+        n_samples, n_features, n_buckets = logits.shape
+
+        scale = self.feature_exp_std_
+        centers = self.head_centers_.to(logits.device)
+        flat = logits.reshape(n_samples * n_features, n_buckets)
+
+        if output_type == "quantiles":
+            return [
+                (
+                    self.head_criterion_.icdf(flat.cpu(), q)
+                    .reshape(n_samples, n_features)
+                    .numpy()
+                    * scale
+                )
+                for q in quantiles
+            ]
+
+        normalized = bucket_means(flat, centers).reshape(
+            n_samples, n_features
+        )
+        raw = normalized.cpu().numpy() * scale
+        return raw
 
     @config_context(transform_output="default")  # type: ignore
     def fit(self, X, y):
@@ -548,6 +687,72 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # TODO: Modify borders definition
         return averaged_logits, outputs, borders
 
+    def forward_with_embeddings(self, X, y, feature_idx):
+        """Like :meth:`forward`, but also return the per-query embeddings.
+
+        Returns the same averaged logits as ``forward`` (so the per-feature
+        training objective is unchanged) *plus* the backbone
+        ``test_embeddings`` for the query rows, which feed the joint head.
+
+        Returns:
+            ``(averaged_logits, embeddings)`` where ``averaged_logits`` has the
+            same shape convention as :meth:`forward` and ``embeddings`` is
+            ``(n_samples, emb_dim)``.
+        """
+        check_is_fitted(self)
+
+        std_borders = self.bardist_.borders.cpu().numpy()
+        outputs: list[torch.Tensor] = []
+        embeddings: list[torch.Tensor] = []
+
+        X = self._prepare_predict_input(X)
+
+        for output, config in self.executor_[feature_idx].iter_outputs(
+            X,
+            y,
+            device=self.device_,
+            autocast=self.use_autocast_,
+            only_return_standard_out=False,
+        ):
+            test_embeddings = output["test_embeddings"]
+            if test_embeddings.ndim == 3:
+                test_embeddings = test_embeddings[:, 0, :]
+            embeddings.append(test_embeddings)
+
+            logits = output["standard"]
+            if logits.ndim == 3:
+                logits = logits.squeeze(1)
+
+            if self.softmax_temperature != 1:
+                logits = logits.float() / self.softmax_temperature
+
+            config_for_ensemble = config
+            if isinstance(config, list) and len(config) == 1:
+                config_for_ensemble = config[0]
+
+            if not isinstance(config_for_ensemble, ExplainerEnsembleConfig):
+                raise ValueError(
+                    "Unexpected config format "
+                    "and Batch prediction is not supported yet!"
+                )
+
+            if config_for_ensemble.target_transform is not None:
+                logit_cancel_mask, _, _ = _transform_borders_one(
+                    std_borders,
+                    target_transform=config_for_ensemble.target_transform,
+                    repair_nan_borders_after_transform=self.interface_config_.FIX_NAN_BORDERS_AFTER_TARGET_TRANSFORM,
+                )
+                if logit_cancel_mask is not None:
+                    logits = logits.clone()
+                    logits[..., logit_cancel_mask] = float("-inf")
+
+            outputs.append(logits)
+
+        all_logits = torch.stack(outputs, dim=0)  # [N_est, N_samples, N_bord]
+        averaged_logits = torch.mean(all_logits, dim=0).transpose(0, 1)
+        stacked_embeddings = torch.stack(embeddings, dim=0).mean(dim=0)
+        return averaged_logits, stacked_embeddings
+
     def predict_feature(
         self,
         X,
@@ -685,8 +890,16 @@ class ExplainerPFN:  # (TabPFNRegressor):
             "main",
         ] = "mean",
         quantiles: list[float] | None = None,
+        mode: Literal["per-feature", "joint"] = "per-feature",
     ):
         check_is_fitted(self)
+
+        if mode == "joint":
+            return self._predict_joint(
+                X, y, output_type=output_type, quantiles=quantiles
+            )
+        if mode != "per-feature":
+            raise ValueError(f"Invalid predict mode: {mode}")
 
         # Check whether model is in inference mode
         for executor in self.executor_:
