@@ -78,6 +78,31 @@ _DEFAULT_KWARGS = dict(
 )
 
 
+# Minimum usable std of the exact do-Shapley labels. A small positive floor:
+# the trainer normalises targets by ``shap.std()``, so a (near-)zero value
+# would blow up the targets. Degenerate datasets are skipped instead.
+_MIN_SHAP_STD = 1e-8
+
+
+def _usable_feature_exp_std(X, y, shap) -> float | None:
+    """Return ``shap.std()`` if the dataset is usable, else ``None``.
+
+    The SCM generator occasionally yields datasets whose target is independent
+    of every feature; their exact do-Shapley labels are then identically zero,
+    so ``shap.std() == 0``. The trainer normalises targets by this std, which
+    turns the whole batch into NaNs (0/0), corrupts the weights and crashes the
+    next forward pass. Non-finite inputs are rejected for the same reason.
+    """
+    if not (
+        np.isfinite(X).all() and np.isfinite(y).all() and np.isfinite(shap).all()
+    ):
+        return None
+    std = float(shap.std())
+    if not np.isfinite(std) or std < _MIN_SHAP_STD:
+        return None
+    return std
+
+
 class SyntheticDataGenerator:
     """Draw SCM datasets with exact do-Shapley training labels.
 
@@ -347,6 +372,12 @@ class TrainingBatchIterator:
             idx.sort()
             X, y, shap = X[idx], y[idx], shap[idx]
 
+        feature_exp_std = _usable_feature_exp_std(X, y, shap)
+        if feature_exp_std is None:
+            # Degenerate dataset (constant/absent labels or non-finite values):
+            # skip it before paying for the throwaway preprocessing fit.
+            return None
+
         xai = ExplainerPFN(
             fit_mode="low_memory", random_state=self.random_state, device="cpu"
         )
@@ -364,7 +395,7 @@ class TrainingBatchIterator:
             "y": y,
             "shap": shap,
             "executor_configs": xai.executor_,
-            "feature_exp_std": float(shap.std()),
+            "feature_exp_std": feature_exp_std,
             # Provenance: lets the trainer persist the exact dataset index so a
             # resumed run can skip the datasets it has already consumed.
             "dataset_index": int(dataset["params"]["index"]),
@@ -391,6 +422,10 @@ class TrainingBatchIterator:
                 if self.max_cells is not None and n_cells >= self.max_cells:
                     continue
                 batch = self._preprocess(dataset)
+                if batch is None:
+                    # Degenerate dataset (e.g. all-zero exact Shapley labels);
+                    # skipped so the trainer never divides by a zero std.
+                    continue
                 self._produced += 1
                 produced_here += 1
                 # Blocking put with stop-awareness.

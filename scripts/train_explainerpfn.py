@@ -627,10 +627,28 @@ def train(args, logger):
                     epoch_head_losses.append(float(head_loss.item()))
                     epoch_eff_losses.append(float(eff_loss.item()))
 
-                epoch_losses.append(batch_loss)
+                if torch.isfinite(batch_loss):
+                    epoch_losses.append(batch_loss)
+                else:
+                    logger(
+                        f"Epoch {epoch}: non-finite batch loss; skipping batch."
+                    )
 
-            total_loss = torch.stack(epoch_losses).mean()
-            total_loss.backward()
+            step_ok = len(epoch_losses) > 0
+            if step_ok:
+                total_loss = torch.stack(epoch_losses).mean()
+                step_ok = bool(torch.isfinite(total_loss))
+            else:
+                total_loss = torch.tensor(float("nan"), device=xai.device_)
+            if step_ok:
+                total_loss.backward()
+            else:
+                # Never call backward/step on a non-finite loss: NaN gradients
+                # would corrupt every weight and crash the next forward pass.
+                logger(
+                    f"Epoch {epoch}: non-finite loss ({total_loss.item():.4f}); "
+                    "skipping optimizer step."
+                )
 
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -642,12 +660,16 @@ def train(args, logger):
                     total_grad_norm += prm.grad.norm().item() ** 2
             total_grad_norm = total_grad_norm**0.5
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-            optimizer.step()
+            if step_ok:
+                torch.nn.utils.clip_grad_norm_(
+                    trainable_params, args.max_grad_norm
+                )
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
 
-            losses.append(float(total_loss.item()))
+            if step_ok:
+                losses.append(float(total_loss.item()))
             data_start_index = last_dataset_index
             last_epoch = epoch
 
