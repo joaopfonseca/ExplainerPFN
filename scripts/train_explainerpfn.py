@@ -742,8 +742,13 @@ def train(args, logger):
                     f"Grad Norm: {total_grad_norm:.3f}, LR: {current_lr:.2e}"
                 )
                 if epoch_head_losses:
+                    head_label = (
+                        "Attribution MSE"
+                        if args.task_mode == "single-pass"
+                        else "Head Loss"
+                    )
                     msg += (
-                        f", Head Loss: {np.mean(epoch_head_losses):.3f}"
+                        f", {head_label}: {np.mean(epoch_head_losses):.3f}"
                         f", Eff: {np.mean(epoch_eff_losses):.4f}"
                     )
                 if device.type == "cuda":
