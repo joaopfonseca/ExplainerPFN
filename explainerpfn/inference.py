@@ -41,7 +41,9 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
 
     X_trains: Sequence[np.ndarray | torch.Tensor]
     y_trains: Sequence[np.ndarray | torch.Tensor]
-    feature_idx: int
+    # ``None`` for the single-pass task (plain score regression); an int for a
+    # per-feature explanation task.
+    feature_idx: int | None
     model: torch.nn.Module
     cat_ixs: Sequence[list[int]]
     ensemble_configs: Sequence[EnsembleConfig]
@@ -108,11 +110,52 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         ]
 
     @classmethod
+    def prepare_single_pass(  # noqa: PLR0913
+        cls,
+        X_train: np.ndarray | torch.Tensor,
+        y_train: np.ndarray | torch.Tensor,
+        *,
+        cat_ix: list[int],
+        model,
+        ensemble_configs: Sequence[EnsembleConfig],
+        n_workers: int,
+        rng: np.random.Generator,
+        dtype_byte_size: int,
+        force_inference_dtype: torch.dtype | None,
+        save_peak_mem: bool | Literal["auto"] | float | int,
+        inference_mode: bool,
+        no_preprocessing: bool = False,
+    ) -> "InferenceEngineCachePreprocessing":
+        """Prepare the single-task executor for the single-pass architecture.
+
+        Unlike :meth:`prepare` (one executor per explained feature), this fits a
+        single preprocessing pipeline on the *plain* score-regression dataset
+        ``(X_train, y_train)`` — no ``[score, x_j, others]`` construction.
+        """
+        return [
+            InferenceEngineCachePreprocessing._prepare(  # type: ignore[misc]
+                X_train=X_train,
+                y_train=y_train,
+                feature_idx=None,
+                cat_ix=cat_ix,
+                model=model,
+                ensemble_configs=ensemble_configs,
+                n_workers=n_workers,
+                rng=rng,
+                dtype_byte_size=dtype_byte_size,
+                force_inference_dtype=force_inference_dtype,
+                save_peak_mem=save_peak_mem,
+                inference_mode=inference_mode,
+                no_preprocessing=no_preprocessing,
+            )
+        ]
+
+    @classmethod
     def _prepare(  # noqa: PLR0913
         cls,
         X_train: np.ndarray | torch.Tensor,
         y_train: np.ndarray | torch.Tensor,
-        feature_idx: int,
+        feature_idx: int | None,
         *,
         cat_ix: list[int],
         model,
@@ -146,27 +189,31 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         Returns:
             The prepared inference engine.
         """
-        X_train, y_train = prepare_explanation_dataset(
-            X=X_train,
-            y=y_train,
-            feature_idx=feature_idx,
-        )
-        # ``prepare_explanation_dataset`` prepends the model score and the
-        # feature being explained, and removes the latter from the feature
-        # block. The categorical indices were inferred on the raw feature
-        # matrix, so they have to be remapped to the new column layout:
-        #   - the explained feature (raw index ``feature_idx``) is at column 1
-        #   - features before it are shifted by +2 (score + explained feature)
-        #   - features after it are shifted by +1 (only the score is prepended)
-        # The score column (0) is never categorical.
-        cat_ix = [
-            1
-            if c == feature_idx
-            else c + 2
-            if c < feature_idx
-            else c + 1
-            for c in cat_ix
-        ]
+        if feature_idx is not None:
+            X_train, y_train = prepare_explanation_dataset(
+                X=X_train,
+                y=y_train,
+                feature_idx=feature_idx,
+            )
+            # ``prepare_explanation_dataset`` prepends the model score and the
+            # feature being explained, and removes the latter from the feature
+            # block. The categorical indices were inferred on the raw feature
+            # matrix, so they have to be remapped to the new column layout:
+            #   - the explained feature (raw index ``feature_idx``) is at column 1
+            #   - features before it are shifted by +2 (score + explained feature)
+            #   - features after it are shifted by +1 (only the score is prepended)
+            # The score column (0) is never categorical.
+            cat_ix = [
+                1
+                if c == feature_idx
+                else c + 2
+                if c < feature_idx
+                else c + 1
+                for c in cat_ix
+            ]
+        # else (single-pass): keep the plain score-regression dataset and the
+        # categorical indices unchanged.
+
         itr = fit_preprocessing(
             configs=ensemble_configs,
             X_train=X_train,
@@ -210,11 +257,14 @@ class InferenceEngineCachePreprocessing(InferenceEngine):
         #     y=y_train,
         #     feature_idx=self.feature_idx,
         # )
-        X, y = prepare_explanation_dataset(
-            X=X,
-            y=y,
-            feature_idx=self.feature_idx,
-        )
+        if self.feature_idx is not None:
+            # Per-feature task: build the [score, x_j, others] query layout.
+            # Single-pass (feature_idx is None) queries are the plain rows.
+            X, y = prepare_explanation_dataset(
+                X=X,
+                y=y,
+                feature_idx=self.feature_idx,
+            )
 
         if not isinstance(X_train, torch.Tensor):
             X_train = torch.as_tensor(X_train, dtype=torch.float32)  # noqa: PLW2901

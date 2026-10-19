@@ -1,31 +1,37 @@
-"""Joint multi-attribution head for ExplainerPFN.
+"""Multi-attribution readout for ExplainerPFN.
 
-The per-feature pipeline runs the backbone once per feature (each on a task
-whose target is that feature's value) and reads one attribution distribution
-per pass. This head keeps that backbone structure but *mixes* the per-feature
-query representations jointly, so all d attribution distributions are produced
-together and can be trained for cross-feature consistency (in particular the
-efficiency identity ``sum_j phi_j = f(x) - base_value``).
+Two backbone modes feed this module:
+
+* **per-feature** (legacy): the backbone runs once per feature (each on a task
+  whose target is that feature's value) and the head *mixes* the per-feature
+  query representations jointly, so all d attributions are produced together
+  and can be trained for cross-feature consistency (the efficiency identity
+  ``sum_j phi_j = f(x) - base_value``).
+* **single-pass**: the backbone runs once over the whole dataset (a plain
+  score-regression task); the query-row embedding ``h`` is shared across slots
+  and expanded, so each slot is conditioned on ``h``, its own value and the
+  score. This is the ``(n, m, p_hat) -> (n, m)`` architecture.
 
 Input, per query row: one token per feature slot ``j``,
 
     token_j = proj(cat(h_j, x_j, score)) + slot_embedding_j
 
-where ``h_j`` is the backbone ``test_embeddings`` for feature ``j``'s task,
-``x_j`` is the query row's value for feature ``j`` and ``score`` is the model
-score (p_hat). The tokens of a row are mixed by a small transformer encoder
-over the feature slots; each slot is then linearly projected to a distribution
-over attribution buckets.
+where ``h_j`` is the backbone ``test_embeddings`` for feature ``j``'s task (or
+the shared single-pass embedding), ``x_j`` is the query row's value for feature
+``j`` and ``score`` is the model score (p_hat). The tokens of a row are mixed
+by a small transformer encoder over the feature slots; each slot is then
+projected to a prediction.
 
-Output: ``logits`` of shape ``(n_samples, n_features, n_buckets)``, read on the
-(possibly downsampled) TabPFN bar-distribution borders on the normalized
-attribution scale (``phi / feature_exp_std`` — same scale as the per-feature
-training target).
+Output: with ``output="distribution"`` (default) ``logits`` of shape
+``(n_samples, n_features, n_buckets)``, read on the (possibly downsampled)
+TabPFN bar-distribution borders on the normalized attribution scale
+(``phi / feature_exp_std``). With ``output="scalar"`` a point estimate of shape
+``(n_samples, n_features)`` on the same normalized scale — no PDF.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -114,6 +120,7 @@ class AttributionHead(nn.Module):
         nhead: int = 6,
         dropout: float = 0.0,
         max_features: int = 15,
+        output: Literal["distribution", "scalar"] = "distribution",
     ):
         super().__init__()
         hidden_dim = int(hidden_dim or emb_dim)
@@ -121,6 +128,8 @@ class AttributionHead(nn.Module):
             raise ValueError(
                 f"hidden_dim={hidden_dim} must be divisible by nhead={nhead}"
             )
+        if output not in ("distribution", "scalar"):
+            raise ValueError(f"Unknown output mode: {output!r}")
         self.emb_dim = int(emb_dim)
         self.n_buckets = int(n_buckets)
         self.hidden_dim = hidden_dim
@@ -128,6 +137,7 @@ class AttributionHead(nn.Module):
         self.nhead = int(nhead)
         self.dropout = float(dropout)
         self.max_features = int(max_features)
+        self.output = output
 
         # Per-slot token: [h_j (emb_dim), x_j (1), score (1)] -> hidden.
         self.token_proj = nn.Linear(emb_dim + 2, hidden_dim)
@@ -149,7 +159,9 @@ class AttributionHead(nn.Module):
             encoder_layer, num_layers=n_layers, enable_nested_tensor=False
         )
 
-        self.out_proj = nn.Linear(hidden_dim, self.n_buckets)
+        self.out_proj = nn.Linear(
+            hidden_dim, 1 if self.output == "scalar" else self.n_buckets
+        )
         nn.init.zeros_(self.out_proj.bias)
 
     # ------------------------------------------------------------------
@@ -166,6 +178,7 @@ class AttributionHead(nn.Module):
             "nhead": self.nhead,
             "dropout": self.dropout,
             "max_features": self.max_features,
+            "output": self.output,
         }
 
     @classmethod
@@ -191,7 +204,9 @@ class AttributionHead(nn.Module):
             score: ``(n_samples,)`` or ``(n_samples, 1)`` model score.
 
         Returns:
-            ``(n_samples, n_features, n_buckets)`` logits.
+            ``(n_samples, n_features, n_buckets)`` logits for
+            ``output="distribution"``, or ``(n_samples, n_features)`` point
+            estimates for ``output="scalar"``.
         """
         if embeddings.ndim != 3:
             raise ValueError(
@@ -216,5 +231,7 @@ class AttributionHead(nn.Module):
         tokens = tokens + self.slot_embedding[:n_features].unsqueeze(0)
 
         mixed = self.mixer(tokens)  # (n, d, hidden)
-        logits = self.out_proj(mixed)  # (n, d, n_buckets)
-        return logits
+        out = self.out_proj(mixed)  # (n, d, n_buckets) or (n, d, 1)
+        if self.output == "scalar":
+            return out.squeeze(-1)  # (n, d) point estimates
+        return out

@@ -103,6 +103,19 @@ def _usable_feature_exp_std(X, y, shap) -> float | None:
     return std
 
 
+def _permute_columns(X, shap, seed: int):
+    """Permute the columns of ``X`` and ``shap`` identically.
+
+    Single-pass order augmentation: because the SHAP labels are permuted with
+    the inputs, readout slot ``j`` still corresponds to the same feature in the
+    permuted layout — nothing needs reordering after the forward pass. The
+    permutation is deterministic given ``seed`` (resume-safe).
+    """
+    perm_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 7]))
+    perm = perm_rng.permutation(X.shape[1])
+    return X[:, perm], shap[:, perm], perm
+
+
 class SyntheticDataGenerator:
     """Draw SCM datasets with exact do-Shapley training labels.
 
@@ -335,6 +348,8 @@ class TrainingBatchIterator:
         device="cpu",
         random_state=None,
         verbose=False,
+        task_mode="explanation",
+        permute_features=False,
     ):
         self.generator = generator if generator is not None else SyntheticDataGenerator()
         self.prefetch = max(1, int(prefetch))
@@ -345,6 +360,8 @@ class TrainingBatchIterator:
         self.device = device
         self.random_state = random_state
         self.verbose = verbose
+        self.task_mode = task_mode
+        self.permute_features = bool(permute_features)
 
         self._queue = queue.Queue(maxsize=self.prefetch)
         self._stop = threading.Event()
@@ -372,6 +389,16 @@ class TrainingBatchIterator:
             idx.sort()
             X, y, shap = X[idx], y[idx], shap[idx]
 
+        if self.task_mode == "single-pass" and self.permute_features:
+            # Order augmentation for the single-pass task: permute the columns
+            # of X and the SHAP targets *identically*. Slot j of the readout
+            # then corresponds to original feature ``perm[j]`` — alignment holds
+            # by construction, so nothing needs reordering after the forward
+            # pass. Deterministic per dataset index (resume-safe).
+            X, shap, _perm = _permute_columns(
+                X, shap, dataset["params"]["seed"]
+            )
+
         feature_exp_std = _usable_feature_exp_std(X, y, shap)
         if feature_exp_std is None:
             # Degenerate dataset (constant/absent labels or non-finite values):
@@ -379,7 +406,10 @@ class TrainingBatchIterator:
             return None
 
         xai = ExplainerPFN(
-            fit_mode="low_memory", random_state=self.random_state, device="cpu"
+            fit_mode="low_memory",
+            random_state=self.random_state,
+            device="cpu",
+            task_mode=self.task_mode,
         )
         xai.fit(X, y)
         # Drop the fitted model; keep only the preprocessing executor configs.
