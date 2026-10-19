@@ -145,6 +145,7 @@ def save_checkpoint(
         "data_start_index": int(data_start_index),
         "rng_state": rng.bit_generator.state,
         "config": vars(args),
+        "task_mode": getattr(args, "task_mode", "explanation"),
     }
     if getattr(xai, "head_", None) is not None:
         payload["head_state_dict"] = xai.head_state_dict()
@@ -356,6 +357,24 @@ def parse_args(argv=None):
         help="Largest number of feature slots (default: n_features_range[1]).",
     )
 
+    sp = p.add_argument_group("single-pass architecture")
+    sp.add_argument(
+        "--task-mode",
+        choices=["explanation", "single-pass"],
+        default="explanation",
+        help="'explanation' = one backbone task per feature (legacy); "
+        "'single-pass' = one backbone task over the whole dataset, with all "
+        "attributions predicted by the head in a single forward pass.",
+    )
+    sp.add_argument(
+        "--permute-features",
+        action="store_true",
+        default=False,
+        help="Single-pass only: apply a random column permutation to each "
+        "training dataset, permuting the SHAP targets identically (order "
+        "augmentation; alignment is preserved by construction).",
+    )
+
     args = p.parse_args(argv)
 
     # Normalise tuple-like args and record the exact resume-relevant data config.
@@ -402,6 +421,8 @@ def make_data_iterator(args, start_index=0):
         device="cpu",
         random_state=args.seed,
         verbose=False,
+        task_mode=getattr(args, "task_mode", "explanation"),
+        permute_features=getattr(args, "permute_features", False),
     )
 
 
@@ -434,8 +455,9 @@ def train(args, logger):
         model_path=args.model_path,
         random_state=args.seed,
         device=device,
-        joint_head=args.joint_head,
+        joint_head=args.joint_head or args.task_mode == "single-pass",
         head_kwargs=head_kwargs,
+        task_mode=args.task_mode,
     )
     xai._initialize_model_variables()
     xai.model_.train()
@@ -556,63 +578,32 @@ def train(args, logger):
                 shap_batch = batch["shap"][indices][-args.num_samples:]
                 executor_configs = batch["executor_configs"]
 
-                batch_loss = 0.0
-                feature_embeddings = []
-                for feature_idx in range(X_batch.shape[1]):
+                if args.task_mode == "single-pass":
+                    # One backbone forward over the whole dataset; every
+                    # feature's attribution comes from the shared row embedding.
                     xai.executor_ = executor_configs
-                    xai.executor_[feature_idx].model = xai.model_
-                    xai.executor_[feature_idx].use_torch_inference_mode(False)
-
+                    xai.executor_[0].model = xai.model_
+                    xai.executor_[0].use_torch_inference_mode(False)
                     with torch.enable_grad():
-                        if xai.head_ is not None:
-                            feature_logits, emb = xai.forward_with_embeddings(
-                                X_batch, y_batch, feature_idx
-                            )
-                            feature_embeddings.append(emb)
-                        else:
-                            feature_logits, outputs, borders = xai.forward(
-                                X_batch,
-                                y_batch,
-                                feature_idx=feature_idx,
-                                only_return_standard_out=True,
-                            )
-                            del outputs, borders  # borders is a numpy array
-
-                    target_shap = torch.tensor(
-                        shap_batch[:, feature_idx] / batch["feature_exp_std"],
-                        dtype=torch.float32,
-                        device=xai.device_,
+                        emb = xai._single_pass_embeddings(X_batch, y_batch)
+                    n_rows = X_batch.shape[0]
+                    n_feats = X_batch.shape[1]
+                    embeddings = emb.view(n_rows, 1, -1).expand(
+                        -1, n_feats, -1
                     )
-                    # bardist lives on CPU (no fit() call moved it to device).
-                    feature_loss = xai.bardist_(
-                        feature_logits.cpu().T, target_shap.cpu()
-                    ).mean()
-                    batch_loss = batch_loss + feature_loss
-
-                batch_loss = batch_loss / X_batch.shape[1]
-
-                if xai.head_ is not None:
-                    embeddings = torch.stack(feature_embeddings, dim=1)
                     features_t = torch.tensor(
                         X_batch, dtype=torch.float32, device=xai.device_
                     )
                     score_t = torch.tensor(
                         y_batch, dtype=torch.float32, device=xai.device_
                     )
-                    head_logits = xai.head_(embeddings, features_t, score_t)
-                    n_s, n_f, n_b = head_logits.shape
-                    flat = head_logits.reshape(n_s * n_f, n_b)
-                    target_flat = torch.tensor(
+                    pred = xai.head_(embeddings, features_t, score_t)  # (n, d)
+                    target = torch.tensor(
                         shap_batch / batch["feature_exp_std"],
                         dtype=torch.float32,
                         device=xai.device_,
-                    ).reshape(-1)
-                    head_loss = xai.head_criterion_(
-                        flat.cpu(), target_flat.cpu()
-                    ).mean()
-                    means = bucket_means(
-                        flat, xai.head_centers_.to(flat.device)
-                    ).reshape(n_s, n_f)
+                    )
+                    mse_loss = ((pred - target) ** 2).mean()
                     # The exact do-Shapley labels satisfy sum_j phi_j = f(x) -
                     # base_value, so their row sums are the efficiency target.
                     target_sum = torch.tensor(
@@ -620,12 +611,83 @@ def train(args, logger):
                         dtype=torch.float32,
                         device=xai.device_,
                     )
-                    eff_loss = efficiency_penalty(means, target_sum)
+                    eff_loss = efficiency_penalty(pred, target_sum)
                     batch_loss = (
-                        batch_loss + head_loss + args.efficiency_weight * eff_loss
+                        mse_loss + args.efficiency_weight * eff_loss
                     )
-                    epoch_head_losses.append(float(head_loss.item()))
+                    epoch_head_losses.append(float(mse_loss.item()))
                     epoch_eff_losses.append(float(eff_loss.item()))
+                else:
+                    batch_loss = 0.0
+                    feature_embeddings = []
+                    for feature_idx in range(X_batch.shape[1]):
+                        xai.executor_ = executor_configs
+                        xai.executor_[feature_idx].model = xai.model_
+                        xai.executor_[feature_idx].use_torch_inference_mode(False)
+
+                        with torch.enable_grad():
+                            if xai.head_ is not None:
+                                feature_logits, emb = xai.forward_with_embeddings(
+                                    X_batch, y_batch, feature_idx
+                                )
+                                feature_embeddings.append(emb)
+                            else:
+                                feature_logits, outputs, borders = xai.forward(
+                                    X_batch,
+                                    y_batch,
+                                    feature_idx=feature_idx,
+                                    only_return_standard_out=True,
+                                )
+                                del outputs, borders  # borders is a numpy array
+
+                        target_shap = torch.tensor(
+                            shap_batch[:, feature_idx] / batch["feature_exp_std"],
+                            dtype=torch.float32,
+                            device=xai.device_,
+                        )
+                        # bardist lives on CPU (no fit() call moved it to device).
+                        feature_loss = xai.bardist_(
+                            feature_logits.cpu().T, target_shap.cpu()
+                        ).mean()
+                        batch_loss = batch_loss + feature_loss
+
+                    batch_loss = batch_loss / X_batch.shape[1]
+
+                    if xai.head_ is not None:
+                        embeddings = torch.stack(feature_embeddings, dim=1)
+                        features_t = torch.tensor(
+                            X_batch, dtype=torch.float32, device=xai.device_
+                        )
+                        score_t = torch.tensor(
+                            y_batch, dtype=torch.float32, device=xai.device_
+                        )
+                        head_logits = xai.head_(embeddings, features_t, score_t)
+                        n_s, n_f, n_b = head_logits.shape
+                        flat = head_logits.reshape(n_s * n_f, n_b)
+                        target_flat = torch.tensor(
+                            shap_batch / batch["feature_exp_std"],
+                            dtype=torch.float32,
+                            device=xai.device_,
+                        ).reshape(-1)
+                        head_loss = xai.head_criterion_(
+                            flat.cpu(), target_flat.cpu()
+                        ).mean()
+                        means = bucket_means(
+                            flat, xai.head_centers_.to(flat.device)
+                        ).reshape(n_s, n_f)
+                        # The exact do-Shapley labels satisfy sum_j phi_j = f(x) -
+                        # base_value, so their row sums are the efficiency target.
+                        target_sum = torch.tensor(
+                            shap_batch.sum(axis=1) / batch["feature_exp_std"],
+                            dtype=torch.float32,
+                            device=xai.device_,
+                        )
+                        eff_loss = efficiency_penalty(means, target_sum)
+                        batch_loss = (
+                            batch_loss + head_loss + args.efficiency_weight * eff_loss
+                        )
+                        epoch_head_losses.append(float(head_loss.item()))
+                        epoch_eff_losses.append(float(eff_loss.item()))
 
                 if torch.isfinite(batch_loss):
                     epoch_losses.append(batch_loss)

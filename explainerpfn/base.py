@@ -264,6 +264,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         n_jobs: int = -1,
         joint_head: bool = False,
         head_kwargs: dict | None = None,
+        task_mode: Literal["explanation", "single-pass"] = "explanation",
     ):
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -277,6 +278,9 @@ class ExplainerPFN:  # (TabPFNRegressor):
         self.n_jobs = n_jobs
         self.joint_head = joint_head
         self.head_kwargs = dict(head_kwargs or {})
+        if task_mode not in ("explanation", "single-pass"):
+            raise ValueError(f"Unknown task_mode: {task_mode!r}")
+        self.task_mode = task_mode
         # Populated by ``initialize_attribution_head`` / ``_initialize_model_variables``.
         self.head_ = None
         self.head_config_ = None
@@ -350,11 +354,27 @@ class ExplainerPFN:  # (TabPFNRegressor):
 
         # preprocess_transforms = self.interface_config_.PREPROCESS_TRANSFORMS
 
+        single_pass = self.task_mode == "single-pass"
+        if single_pass and self.n_estimators != 1:
+            raise ValueError(
+                "task_mode='single-pass' supports a single estimator "
+                f"(n_estimators=1); got {self.n_estimators}."
+            )
+
         ensemble_configs = EnsembleConfig.generate_for_explainability(
             n=self.n_estimators,  # refers to the number of estimators
             subsample_size=self.interface_config_.SUBSAMPLE_SAMPLES,
             add_fingerprint_feature=self.interface_config_.FINGERPRINT_FEATURE,
-            feature_shift_decoder=self.interface_config_.FEATURE_SHIFT_METHOD,
+            # The per-feature path shuffles the tail columns inside each task.
+            # The single-pass task is a plain dataset, so it uses the identity
+            # order: any order augmentation is applied to the data upstream,
+            # with the SHAP targets permuted identically (nothing is reordered
+            # after the forward pass).
+            feature_shift_decoder=(
+                None
+                if single_pass
+                else self.interface_config_.FEATURE_SHIFT_METHOD
+            ),
             polynomial_features=self.interface_config_.POLYNOMIAL_FEATURES,
             max_index=len(X),
             preprocessor_configs=typing.cast(
@@ -463,6 +483,11 @@ class ExplainerPFN:  # (TabPFNRegressor):
         kwargs.setdefault("emb_dim", self.config_.emsize)
         kwargs.setdefault("n_buckets", 256)
         kwargs.setdefault("max_features", 15)
+        # Single-pass predicts point estimates directly; the per-feature path
+        # keeps the distributional readout unless told otherwise.
+        kwargs.setdefault(
+            "output", "scalar" if self.task_mode == "single-pass" else "distribution"
+        )
         self.head_ = AttributionHead(**kwargs)
         self.head_config_ = self.head_.config()
 
@@ -486,6 +511,11 @@ class ExplainerPFN:  # (TabPFNRegressor):
         )
         if not isinstance(checkpoint, dict) or "head_state_dict" not in checkpoint:
             return False
+        task_mode = checkpoint.get("task_mode")
+        if task_mode in ("explanation", "single-pass"):
+            # Adopt the architecture recorded by the checkpoint so ``fit``
+            # builds the matching executor even if the constructor defaulted.
+            self.task_mode = task_mode
         self.initialize_attribution_head(checkpoint.get("head_config"))
         self.head_.load_state_dict(checkpoint["head_state_dict"])
         self.head_.to(self.device_)
@@ -510,6 +540,28 @@ class ExplainerPFN:  # (TabPFNRegressor):
             embeddings.append(test_embeddings)
         return torch.stack(embeddings, dim=1)
 
+    def _single_pass_embeddings(self, X, y) -> torch.Tensor:
+        """Query-row ``test_embeddings`` from the single-pass executor.
+
+        One forward over the plain score-regression task. Returns
+        ``(n_samples, emb_dim)``.
+        """
+        X = self._prepare_predict_input(X)
+        embeddings = []
+        for output, _config in self.executor_[0].iter_outputs(
+            X,
+            y,
+            device=self.device_,
+            autocast=self.use_autocast_,
+            only_return_standard_out=False,
+        ):
+            emb = output["test_embeddings"]
+            if emb.ndim == 3:
+                emb = emb[:, 0, :]
+            embeddings.append(emb)
+        # ``task_mode='single-pass'`` enforces a single estimator.
+        return embeddings[0]
+
     def _predict_joint(
         self,
         X,
@@ -532,7 +584,12 @@ class ExplainerPFN:  # (TabPFNRegressor):
         if quantiles is None:
             quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
-        embeddings = self._collect_feature_embeddings(X, y)
+        if self.task_mode == "single-pass":
+            # One forward: the row embedding is shared across feature slots.
+            emb = self._single_pass_embeddings(X, y)  # (n, emb)
+            embeddings = emb.unsqueeze(1).expand(-1, self.n_features_in_, -1)
+        else:
+            embeddings = self._collect_feature_embeddings(X, y)
         features = np.asarray(
             self._prepare_predict_input(X), dtype=np.float32
         )
@@ -544,10 +601,20 @@ class ExplainerPFN:  # (TabPFNRegressor):
             score, dtype=torch.float32, device=self.device_
         )
         with torch.inference_mode():
-            logits = self.head_(embeddings, features_t, score_t)  # (n, d, K)
-        n_samples, n_features, n_buckets = logits.shape
+            out = self.head_(embeddings, features_t, score_t)
 
         scale = self.feature_exp_std_
+
+        if getattr(self.head_, "output", "distribution") == "scalar":
+            if output_type == "quantiles":
+                raise ValueError(
+                    "output_type='quantiles' is not available with a scalar "
+                    "attribution head (single-pass predicts point estimates)."
+                )
+            return out.cpu().numpy() * scale  # (n, d)
+
+        logits = out  # (n, d, K)
+        n_samples, n_features, n_buckets = logits.shape
         centers = self.head_centers_.to(logits.device)
         flat = logits.reshape(n_samples * n_features, n_buckets)
 
@@ -608,8 +675,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
             self.bardist_.borders * self.feature_exp_std_  # + self.y_train_mean_,
         ).float()
 
-        # Create the inference engine
-        self.executor_ = InferenceEngineCachePreprocessing.prepare(
+        # Create the inference engine. The per-feature path builds one executor
+        # per explained feature; the single-pass path builds one executor for
+        # the plain score-regression task.
+        executor_kwargs = dict(
             X_train=X,
             y_train=y,
             cat_ix=self.inferred_categorical_indices_,
@@ -622,6 +691,14 @@ class ExplainerPFN:  # (TabPFNRegressor):
             save_peak_mem=self.memory_saving_mode,
             inference_mode=True,  # set to False if backprop is needed
         )
+        if self.task_mode == "single-pass":
+            self.executor_ = InferenceEngineCachePreprocessing.prepare_single_pass(
+                **executor_kwargs
+            )
+        else:
+            self.executor_ = InferenceEngineCachePreprocessing.prepare(
+                **executor_kwargs
+            )
 
         return self
 
@@ -928,6 +1005,11 @@ class ExplainerPFN:  # (TabPFNRegressor):
             )
         if mode != "per-feature":
             raise ValueError(f"Invalid predict mode: {mode}")
+        if self.task_mode == "single-pass":
+            raise ValueError(
+                "task_mode='single-pass' produces all attributions in one "
+                "forward pass; only mode='joint' is available."
+            )
 
         # Check whether model is in inference mode
         for executor in self.executor_:
@@ -1057,6 +1139,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
         if self.head_ is not None:
             checkpoint["head_state_dict"] = self.head_state_dict()
             checkpoint["head_config"] = self.head_config_
+        # Record the backbone task construction so the file is self-describing.
+        checkpoint["task_mode"] = self.task_mode
 
         # Save the checkpoint
         torch.save(checkpoint, path)
