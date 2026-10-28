@@ -493,6 +493,7 @@ def test_save_foundation_model_records_v4_layout(tmp_path):
     ckpt = torch.load(path, weights_only=False)
     assert ckpt["features_per_group"] == 1
     assert ckpt["use_item_states"] is True
+    assert ckpt["strict_item_layout"] is True
     assert ckpt["head_config"]["residual"] is True
 
     restored = ExplainerPFN()
@@ -502,6 +503,74 @@ def test_save_foundation_model_records_v4_layout(tmp_path):
     assert restored.load_attribution_head(path) is True
     assert restored.features_per_group == 1
     assert restored.use_item_states is True
+    assert restored.strict_item_layout is True
+
+
+def test_strict_item_layout_is_enabled_by_default():
+    assert ExplainerPFN().strict_item_layout is True
+    assert ExplainerPFN(strict_item_layout=False).strict_item_layout is False
+
+
+def test_legacy_checkpoint_uses_legacy_layout(tmp_path):
+    """Checkpoints written before the strict layout predate the field."""
+    head = _scalar_head()
+    path = tmp_path / "legacy.pt"
+    torch.save(
+        {
+            "model_state_dict": {},
+            "optimizer_state_dict": {},
+            "epoch": 10,
+            "head_state_dict": head.state_dict(),
+            "head_config": head.config(),
+            "task_mode": "single-pass",
+        },
+        path,
+    )
+
+    xai = ExplainerPFN()
+    xai.config_ = _FakeConfig(8)
+    xai.bardist_ = FullSupportBarDistribution(torch.linspace(-3.0, 3.0, 513))
+    xai.device_ = torch.device("cpu")
+    assert xai.load_attribution_head(path) is True
+    assert xai.strict_item_layout is False
+
+
+def test_fresh_head_ignores_embedded_checkpoint_head(tmp_path, monkeypatch):
+    path = tmp_path / "v4.ckp"
+    torch.save({"model_state_dict": {}, "head_state_dict": {}, "head_config": {}}, path)
+
+    monkeypatch.setattr(
+        base_mod,
+        "initialize_explainerpfn_model",
+        lambda model_path, fit_mode: (
+            _FakeModel(8),
+            _FakeConfig(8),
+            FullSupportBarDistribution(torch.linspace(-3.0, 3.0, 513)),
+        ),
+    )
+    monkeypatch.setattr(
+        base_mod, "determine_precision", lambda *a, **k: (False, None, 1)
+    )
+    monkeypatch.setattr(base_mod, "update_encoder_params", lambda **k: None)
+
+    xai = ExplainerPFN(
+        model_path=str(path),
+        device="cpu",
+        task_mode="single-pass",
+        joint_head=True,
+        fresh_head=True,
+        use_linear_prior=True,
+        head_kwargs={"hidden_dim": 12, "nhead": 3, "n_layers": 1, "n_buckets": 4},
+    )
+    calls = []
+    monkeypatch.setattr(
+        xai, "load_attribution_head", lambda *a, **k: calls.append(1) or True
+    )
+    xai._initialize_model_variables()
+
+    assert calls == []
+    assert xai.head_ is not None
+    assert xai.head_.use_prior is True
 
 
 def test_predict_residual_correction_clamp(monkeypatch):

@@ -23,6 +23,7 @@ from explainerpfn.preprocessing import (
     EnsembleConfig,
     PreprocessorConfig,
     default_explanation_preprocessor_configs,
+    strict_item_preprocessor_configs,
 )
 from tabpfn.model.bar_distribution import FullSupportBarDistribution
 from tabpfn.utils import (
@@ -32,7 +33,6 @@ from tabpfn.utils import (
     update_encoder_params,
     _fix_dtypes,
     _get_ordinal_encoder,
-    _process_text_na_dataframe,
     _transform_borders_one,
 )
 from explainerpfn.config import ModelInterfaceConfig
@@ -45,6 +45,7 @@ from explainerpfn.model.attribution_head import (
 )
 from explainerpfn.model_loading import load_model_criterion_config
 from explainerpfn.utils import (
+    process_text_na_dataframe,
     linear_correction,
     additive_correction,
     multiplicative_correction,
@@ -269,6 +270,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
         use_linear_prior: bool = False,
         features_per_group: int | None = None,
         use_item_states: bool = False,
+        strict_item_layout: bool = True,
+        fresh_head: bool = False,
         correction_clamp: float | None = None,
     ):
         self.n_estimators = n_estimators
@@ -293,6 +296,15 @@ class ExplainerPFN:  # (TabPFNRegressor):
                 raise ValueError("features_per_group must be >= 1")
         self.features_per_group = features_per_group
         self.use_item_states = bool(use_item_states)
+        # Exact one-item-per-feature layout: no appended/fingerprint/SVD
+        # columns, no constant-column removal, plain ordinal encoding. The
+        # encoder input width then equals the number of raw features, so the
+        # item-state -> feature mapping is the identity.
+        self.strict_item_layout = bool(strict_item_layout)
+        # Ignore a head embedded in ``model_path`` and build a fresh one (used
+        # when re-initialising the backbone of a previous run under a new
+        # preprocessing layout).
+        self.fresh_head = bool(fresh_head)
         if correction_clamp is not None and float(correction_clamp) <= 0:
             raise ValueError("correction_clamp must be > 0 or None")
         # Optional safety bound on the residual head's correction: the
@@ -349,7 +361,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # Ensure categories are ordinally encoded
         ord_encoder = _get_ordinal_encoder()
 
-        X = _process_text_na_dataframe(
+        X = process_text_na_dataframe(
             X,
             ord_encoder=ord_encoder,
             fit_encoder=True,  # type: ignore
@@ -378,6 +390,13 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # preprocess_transforms = self.interface_config_.PREPROCESS_TRANSFORMS
 
         single_pass = self.task_mode == "single-pass"
+        if self.strict_item_layout and (
+            self.interface_config_.POLYNOMIAL_FEATURES != "no"
+        ):
+            raise ValueError(
+                "strict_item_layout requires POLYNOMIAL_FEATURES='no' "
+                "(polynomial features would add columns)"
+            )
         if single_pass and self.n_estimators != 1:
             raise ValueError(
                 "task_mode='single-pass' supports a single estimator "
@@ -387,7 +406,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
         ensemble_configs = EnsembleConfig.generate_for_explainability(
             n=self.n_estimators,  # refers to the number of estimators
             subsample_size=self.interface_config_.SUBSAMPLE_SAMPLES,
-            add_fingerprint_feature=self.interface_config_.FINGERPRINT_FEATURE,
+            add_fingerprint_feature=(
+                self.interface_config_.FINGERPRINT_FEATURE
+                and not self.strict_item_layout
+            ),
             # The per-feature path shuffles the tail columns inside each task.
             # The single-pass task is a plain dataset, so it uses the identity
             # order: any order augmentation is applied to the data upstream,
@@ -402,10 +424,15 @@ class ExplainerPFN:  # (TabPFNRegressor):
             max_index=len(X),
             preprocessor_configs=typing.cast(
                 "Sequence[PreprocessorConfig]",
-                default_explanation_preprocessor_configs(),
+                (
+                    strict_item_preprocessor_configs()
+                    if self.strict_item_layout
+                    else default_explanation_preprocessor_configs()
+                ),
             ),
             target_transforms=target_preprocessors,
             random_state=rng,
+            remove_constant_features=not self.strict_item_layout,
         )
 
         self.bardist_ = self.bardist_.to(self.device_)
@@ -474,9 +501,11 @@ class ExplainerPFN:  # (TabPFNRegressor):
         )
         if self.head_ is None:
             loaded_head = False
-            if isinstance(self.model_path, (str, Path)) and Path(
-                self.model_path
-            ).is_file():
+            if (
+                not self.fresh_head
+                and isinstance(self.model_path, (str, Path))
+                and Path(self.model_path).is_file()
+            ):
                 # A checkpoint may carry a joint attribution head (trainer
                 # ``.pt`` files and ``*.ckp`` files saved with an embedded head
                 # both store top-level ``head_state_dict``/``head_config``).
@@ -540,7 +569,17 @@ class ExplainerPFN:  # (TabPFNRegressor):
         checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
-        if not isinstance(checkpoint, dict) or "head_state_dict" not in checkpoint:
+        if not isinstance(checkpoint, dict):
+            return False
+        # Restore the preprocessing layout the checkpoint was trained with.
+        # Checkpoints written before the field existed (v2-v4) used the legacy
+        # layout (SVD components + fingerprint); foundation checkpoints carry
+        # no layout information and keep the constructor default.
+        if "strict_item_layout" in checkpoint:
+            self.strict_item_layout = bool(checkpoint["strict_item_layout"])
+        elif "model_state_dict" in checkpoint:
+            self.strict_item_layout = False
+        if "head_state_dict" not in checkpoint:
             return False
         task_mode = checkpoint.get("task_mode")
         if task_mode in ("explanation", "single-pass"):
@@ -892,10 +931,25 @@ class ExplainerPFN:  # (TabPFNRegressor):
             )
 
         if self.use_item_states:
-            # Map preprocessed encoder columns back to raw feature order.
-            self.item_mapping_ = fit_item_mapping(
-                self.X_, np.asarray(self.executor_[0].X_trains[0])
+            n_preprocessed = int(
+                np.asarray(self.executor_[0].X_trains[0]).shape[1]
             )
+            if self.strict_item_layout:
+                # No appended/fingerprint/SVD columns and no constant-column
+                # removal: encoder item ``j`` is raw feature ``j``.
+                if n_preprocessed != self.n_features_in_:
+                    raise ValueError(
+                        "strict_item_layout expected one preprocessed column "
+                        f"per raw feature, got {n_preprocessed} for "
+                        f"{self.n_features_in_} features"
+                    )
+                self.item_mapping_ = np.arange(self.n_features_in_, dtype=int)
+            else:
+                # Legacy layout: map preprocessed encoder columns back to raw
+                # feature order by value matching.
+                self.item_mapping_ = fit_item_mapping(
+                    self.X_, np.asarray(self.executor_[0].X_trains[0])
+                )
         else:
             self.item_mapping_ = None
 
@@ -1173,7 +1227,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         if not hasattr(self, "inferred_categorical_indices_"):
             return np.asarray(X, dtype=np.float64)
         X = _fix_dtypes(X, cat_indices=self.inferred_categorical_indices_)
-        X = _process_text_na_dataframe(X, ord_encoder=self.preprocessor_)
+        X = process_text_na_dataframe(X, ord_encoder=self.preprocessor_)
         return X
 
     def predict(
@@ -1342,6 +1396,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         checkpoint["task_mode"] = self.task_mode
         checkpoint["features_per_group"] = self.features_per_group
         checkpoint["use_item_states"] = self.use_item_states
+        checkpoint["strict_item_layout"] = self.strict_item_layout
 
         # Save the checkpoint
         torch.save(checkpoint, path)

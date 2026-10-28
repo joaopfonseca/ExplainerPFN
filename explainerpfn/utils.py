@@ -14,9 +14,70 @@ import time
 from typing import Callable, Optional, TypeVar
 
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import LinearRegression
 
 F = TypeVar("F", bound=Callable[..., object])
+
+NA_PLACEHOLDER = "__MISSING__"
+
+
+def _restore_encoder_column_order(
+    X_encoded, ord_encoder, columns: "pd.Index"
+) -> np.ndarray:
+    """Undo the categorical-first reordering of the ordinal ``ColumnTransformer``."""
+    X_encoded = np.asarray(X_encoded)
+    if ord_encoder is None or not hasattr(ord_encoder, "transformers_"):
+        return X_encoded
+    selected = list(ord_encoder.transformers_[0][2])
+    if not selected:
+        return X_encoded
+    position = {col: i for i, col in enumerate(columns)}
+    selected_pos = [position[col] for col in selected]
+    out_order = selected_pos + [
+        i for i in range(len(columns)) if i not in set(selected_pos)
+    ]
+    return X_encoded[:, np.argsort(np.asarray(out_order))]
+
+
+def process_text_na_dataframe(
+    X: "pd.DataFrame",
+    placeholder: str = NA_PLACEHOLDER,
+    ord_encoder=None,
+    *,
+    fit_encoder: bool = False,
+) -> np.ndarray:
+    """Ordinal-encode text/category columns, preserving the column order.
+
+    Mirror of ``tabpfn.utils._process_text_na_dataframe``. The sklearn
+    ``ColumnTransformer`` inside the ordinal encoder emits the encoded
+    categorical columns *first*, which silently permutes the features.  That is
+    harmless for a permutation-invariant regressor but corrupts per-feature
+    attribution slots, so the original column order is restored here.
+    """
+    X = X.copy()
+    string_cols = X.select_dtypes(include=["string", "object"]).columns
+    if len(string_cols) > 0:
+        X[string_cols] = X[string_cols].fillna(placeholder)
+
+    if fit_encoder and ord_encoder is not None:
+        X_encoded = ord_encoder.fit_transform(X)
+    elif ord_encoder is not None:
+        X_encoded = ord_encoder.transform(X)
+    else:
+        X_encoded = np.asarray(X)
+
+    X_encoded = _restore_encoder_column_order(X_encoded, ord_encoder, X.columns)
+
+    string_cols_ix = [X.columns.get_loc(col) for col in string_cols]
+    if len(string_cols_ix) > 0:
+        placeholder_mask = (X[string_cols] == placeholder).to_numpy()
+        X_encoded[:, string_cols_ix] = np.where(
+            placeholder_mask,
+            np.nan,
+            X_encoded[:, string_cols_ix],
+        )
+    return np.asarray(X_encoded, dtype=np.float64)
 
 
 def _retry_io(

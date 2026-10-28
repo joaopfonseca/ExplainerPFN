@@ -47,7 +47,6 @@ import numpy as np
 import pandas as pd
 
 from explainerpfn.train.dag_generators import DAGGenerator
-from explainerpfn.utils import fit_item_mapping
 
 __all__ = ["SyntheticDataGenerator", "TrainingBatchIterator"]
 
@@ -353,6 +352,7 @@ class TrainingBatchIterator:
         permute_features=False,
         linear_prior=False,
         item_states=False,
+        strict_item_layout=True,
     ):
         self.generator = generator if generator is not None else SyntheticDataGenerator()
         self.prefetch = max(1, int(prefetch))
@@ -367,6 +367,7 @@ class TrainingBatchIterator:
         self.permute_features = bool(permute_features)
         self.linear_prior = bool(linear_prior)
         self.item_states = bool(item_states)
+        self.strict_item_layout = bool(strict_item_layout)
 
         self._queue = queue.Queue(maxsize=self.prefetch)
         self._stop = threading.Event()
@@ -425,19 +426,24 @@ class TrainingBatchIterator:
             random_state=self.random_state,
             device="cpu",
             task_mode=self.task_mode,
+            use_item_states=self.item_states,
+            strict_item_layout=self.strict_item_layout,
         )
         xai.fit(X, y)
         item_mapping = None
         if self.task_mode == "single-pass" and self.item_states:
-            # With features_per_group=1 the encoder emits one item per
-            # preprocessed feature; map those back to raw column order.
-            try:
-                item_mapping = fit_item_mapping(
-                    xai.X_, np.asarray(xai.executor_[0].X_trains[0])
+            # With the exact one-item-per-feature layout the encoder emits one
+            # item per raw feature, in raw column order.
+            n_preprocessed = int(
+                np.asarray(xai.executor_[0].X_trains[0]).shape[1]
+            )
+            if n_preprocessed != X.shape[1]:
+                raise RuntimeError(
+                    "item-state preprocessing changed the column count: "
+                    f"{X.shape[1]} raw features -> {n_preprocessed} "
+                    "preprocessed columns"
                 )
-            except ValueError:
-                # Unalignable columns (e.g. dropped constants): skip dataset.
-                return None
+            item_mapping = np.arange(X.shape[1], dtype=int)
         # Drop the fitted model; keep only the preprocessing executor configs.
         del xai.model_
         for executor in xai.executor_:

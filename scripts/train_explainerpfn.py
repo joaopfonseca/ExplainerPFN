@@ -148,6 +148,7 @@ def save_checkpoint(
         "task_mode": getattr(args, "task_mode", "explanation"),
         "features_per_group": getattr(xai, "features_per_group", None),
         "use_item_states": getattr(xai, "use_item_states", False),
+        "strict_item_layout": getattr(xai, "strict_item_layout", False),
     }
     if getattr(xai, "head_", None) is not None:
         payload["head_state_dict"] = xai.head_state_dict()
@@ -414,6 +415,24 @@ def parse_args(argv=None):
         help="Override the encoder's feature grouping (1 = one item per "
         "feature). Default: keep the checkpoint's value.",
     )
+    sp.add_argument(
+        "--strict-item-layout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exact one-item-per-feature layout: keep the preprocessing width "
+        "equal to the number of raw features (no SVD components, no "
+        "fingerprint column, no constant-column removal, plain ordinal "
+        "encoding). Enabled by default; use --no-strict-item-layout to "
+        "reproduce the legacy (v2-v4) preprocessing.",
+    )
+    sp.add_argument(
+        "--fresh-head",
+        action="store_true",
+        default=False,
+        help="Ignore an attribution head embedded in --model-path and build a "
+        "fresh one (used when re-initialising a backbone under a new "
+        "preprocessing layout).",
+    )
 
     args = p.parse_args(argv)
 
@@ -478,6 +497,7 @@ def make_data_iterator(args, start_index=0):
         permute_features=getattr(args, "permute_features", False),
         linear_prior=getattr(args, "linear_prior", False),
         item_states=getattr(args, "item_states", False),
+        strict_item_layout=getattr(args, "strict_item_layout", True),
     )
 
 
@@ -518,6 +538,8 @@ def train(args, logger):
         use_linear_prior=args.linear_prior,
         features_per_group=args.features_per_group,
         use_item_states=args.item_states,
+        strict_item_layout=args.strict_item_layout,
+        fresh_head=args.fresh_head,
     )
     xai._initialize_model_variables()
     xai.model_.train()
@@ -809,11 +831,27 @@ def train(args, logger):
                 torch.cuda.empty_cache()
             gc.collect()
 
+            # Compute the gradient norm and validate finiteness *before* the
+            # step. A finite loss can still produce non-finite gradients (e.g.
+            # a bf16 overflow in a long attention backward); stepping with them
+            # corrupts every weight and crashes the next forward pass.
             total_grad_norm = 0.0
+            grads_finite = True
             for prm in trainable_params:
                 if prm.grad is not None:
+                    if not torch.isfinite(prm.grad).all():
+                        grads_finite = False
+                        break
                     total_grad_norm += prm.grad.norm().item() ** 2
             total_grad_norm = total_grad_norm**0.5
+
+            if step_ok and not grads_finite:
+                logger(
+                    f"Epoch {epoch}: non-finite gradients; skipping optimizer "
+                    "step."
+                )
+                step_ok = False
+                optimizer.zero_grad(set_to_none=True)
 
             if step_ok:
                 if args.max_grad_norm is not None and args.max_grad_norm > 0:
@@ -823,6 +861,17 @@ def train(args, logger):
                 optimizer.step()
             if scheduler is not None:
                 scheduler.step()
+
+            if step_ok:
+                # Belt and braces: if a weight still went non-finite, stop now
+                # and let ``--auto-resume`` restore the last good checkpoint.
+                if not all(torch.isfinite(p).all() for p in trainable_params):
+                    logger(
+                        f"Epoch {epoch}: non-finite weights after the step; "
+                        "stopping so the run can resume from the last "
+                        "checkpoint."
+                    )
+                    break
 
             if step_ok:
                 losses.append(float(total_loss.item()))
