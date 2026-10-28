@@ -191,3 +191,348 @@ def test_predict_quantiles_rejected_for_scalar(monkeypatch):
     )
     with pytest.raises(ValueError, match="quantiles"):
         xai.predict(np.zeros((4, 3)), np.zeros(4), output_type="quantiles")
+
+
+# ── LinearSHAP prior channel (v3) ─────────────────────────────────────
+
+
+def _prior_head(emb_dim=8) -> AttributionHead:
+    return AttributionHead(
+        emb_dim=emb_dim,
+        n_buckets=4,
+        hidden_dim=8,
+        nhead=2,
+        n_layers=1,
+        max_features=15,
+        output="scalar",
+        use_prior=True,
+    )
+
+
+def test_head_prior_channel_shape_and_config_roundtrip():
+    head = _prior_head()
+    n, d = 5, 4
+    emb, feat, score, prior = (
+        torch.randn(n, d, 8),
+        torch.randn(n, d),
+        torch.randn(n),
+        torch.randn(n, d),
+    )
+    out = head(emb, feat, score, prior)
+    assert out.shape == (n, d)
+
+    cfg = head.config()
+    assert cfg["use_prior"] is True
+    clone = AttributionHead.from_config(cfg)
+    assert clone.config() == cfg
+    clone.load_state_dict(head.state_dict())
+    assert torch.allclose(
+        head(emb, feat, score, prior), clone(emb, feat, score, prior)
+    )
+
+
+def test_head_prior_validation():
+    emb, feat, score = (
+        torch.randn(3, 2, 8),
+        torch.randn(3, 2),
+        torch.randn(3),
+    )
+    with pytest.raises(ValueError, match="no prior"):
+        _prior_head()(emb, feat, score)
+    with pytest.raises(ValueError, match="use_prior=False"):
+        _scalar_head()(emb, feat, score, torch.randn(3, 2))
+
+
+def test_old_head_config_without_prior_still_loads():
+    # A v1/v2 checkpoint has no ``use_prior`` key in its head config.
+    cfg = {
+        "emb_dim": 8,
+        "n_buckets": 4,
+        "hidden_dim": 8,
+        "n_layers": 1,
+        "nhead": 2,
+        "dropout": 0.0,
+        "max_features": 15,
+        "output": "scalar",
+    }
+    head = AttributionHead.from_config(cfg)
+    assert head.use_prior is False
+    assert head.config()["use_prior"] is False
+
+
+def test_linear_prior_matches_ols_and_is_permutation_aligned():
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(40, 5))
+    y = 3.0 * X[:, 0] - 2.0 * X[:, 1] + 0.5 * X[:, 4] + 1.0
+
+    xai = ExplainerPFN(task_mode="single-pass", use_linear_prior=True)
+    xai._fit_linear_prior(X, y)
+    np.testing.assert_allclose(
+        xai.linear_prior_coef_[[0, 1, 4]], [3.0, -2.0, 0.5], atol=1e-6
+    )
+    np.testing.assert_allclose(
+        xai.linear_prior_coef_[[2, 3]], [0.0, 0.0], atol=1e-6
+    )
+
+    shap = X * 10.0  # labels only used for permutation alignment
+    Xp, _, perm = _permute_columns(X, shap, seed=7)
+    prior = xai._linear_prior(X)
+    # Computing the prior on the permuted X equals permuting the prior.
+    xai._fit_linear_prior(Xp, y)
+    np.testing.assert_allclose(
+        xai._linear_prior(Xp), prior[:, perm], atol=1e-8
+    )
+
+
+def test_predict_single_pass_passes_prior(monkeypatch):
+    xai = _prepared_single_pass(monkeypatch)
+    xai.head_ = _prior_head()
+    xai.use_linear_prior = True
+    xai.linear_prior_coef_ = np.array([1.0, -2.0, 0.5])
+    xai.linear_prior_mean_ = np.array([0.5, 0.0, -1.0])
+    monkeypatch.setattr(
+        xai, "_single_pass_embeddings", lambda X, y: torch.zeros(len(X), 8)
+    )
+
+    captured = {}
+    original = xai.head_.forward
+
+    def wrapped(emb, feat, score, prior=None, confidence=None):
+        captured["prior"] = None if prior is None else prior.detach().clone()
+        return original(emb, feat, score, prior, confidence)
+
+    monkeypatch.setattr(xai.head_, "forward", wrapped)
+
+    X = np.array([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]])
+    y = np.array([0.1, 0.2])
+    out = xai.predict(X, y)
+
+    expected = ((X - xai.linear_prior_mean_) * xai.linear_prior_coef_) / (
+        xai.feature_exp_std_
+    )
+    assert captured["prior"] is not None
+    np.testing.assert_allclose(
+        captured["prior"].numpy(), expected.astype(np.float32), atol=1e-6
+    )
+    assert out.shape == (2, 3)
+
+
+# ── v4: item states, confidence, residual ─────────────────────────────
+
+
+def _v4_head(emb_dim=8) -> AttributionHead:
+    return AttributionHead(
+        emb_dim=emb_dim,
+        n_buckets=4,
+        hidden_dim=8,
+        nhead=2,
+        n_layers=1,
+        max_features=15,
+        output="scalar",
+        use_prior=True,
+        use_confidence=True,
+        residual=True,
+    )
+
+
+def test_head_residual_starts_exactly_at_prior():
+    head = _v4_head()
+    n, d = 4, 3
+    emb = torch.randn(n, d, 8)
+    feat = torch.randn(n, d)
+    score = torch.randn(n)
+    prior = torch.randn(n, d)
+    conf = torch.rand(n)
+    out = head(emb, feat, score, prior, conf)
+    # Zero-initialised output layer => the correction is exactly zero at init.
+    assert torch.allclose(out, prior)
+
+
+def test_head_residual_and_confidence_config_roundtrip():
+    head = _v4_head()
+    cfg = head.config()
+    assert cfg["residual"] is True
+    assert cfg["use_confidence"] is True
+    clone = AttributionHead.from_config(cfg)
+    assert clone.config() == cfg
+    clone.load_state_dict(head.state_dict())
+    emb, feat, score = torch.randn(3, 2, 8), torch.randn(3, 2), torch.randn(3)
+    prior, conf = torch.randn(3, 2), torch.rand(3)
+    assert torch.allclose(
+        head(emb, feat, score, prior, conf),
+        clone(emb, feat, score, prior, conf),
+    )
+
+
+def test_head_residual_requires_prior_and_scalar():
+    with pytest.raises(ValueError, match="requires use_prior"):
+        AttributionHead(output="scalar", residual=True)
+    with pytest.raises(ValueError, match="scalar"):
+        AttributionHead(output="distribution", residual=True, use_prior=True)
+
+
+def test_head_confidence_validation():
+    emb, feat, score = torch.randn(3, 2, 8), torch.randn(3, 2), torch.randn(3)
+    prior = torch.randn(3, 2)
+    with pytest.raises(ValueError, match="no confidence"):
+        _v4_head()(emb, feat, score, prior)
+    with pytest.raises(ValueError, match="use_confidence=False"):
+        _scalar_head()(emb, feat, score, None, torch.zeros(3))
+
+
+def test_fit_item_mapping_handles_permutation_recoding_and_extra_columns():
+    from explainerpfn.utils import fit_item_mapping
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(60, 4))
+    perm = np.array([2, 0, 3, 1])
+    recoded = X[:, perm] ** 3  # monotone (power) recode of permuted columns
+    fingerprints = rng.normal(size=(60, 2))
+    X_pre = np.column_stack(
+        [
+            fingerprints[:, 0],
+            recoded[:, 0],  # raw 2
+            fingerprints[:, 1],
+            recoded[:, 1],  # raw 0
+            recoded[:, 2],  # raw 1
+            recoded[:, 3],  # raw 3
+        ]
+    )
+    mapping = fit_item_mapping(X, X_pre)
+    # X_pre = [fp0, X2^3, fp1, X0^3, X3^3, X1^3]
+    assert mapping.tolist() == [3, 5, 1, 4]
+
+
+def test_fit_item_mapping_raises_on_unmatched_columns():
+    from explainerpfn.utils import fit_item_mapping
+
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(40, 3))
+    X_pre = rng.normal(size=(40, 3))  # unrelated columns
+    with pytest.raises(ValueError, match="could not match"):
+        fit_item_mapping(X, X_pre)
+
+
+class _FakeExecutor:
+    def __init__(self, items):
+        self._items = items
+
+    def iter_outputs(self, X, y, *, device, autocast, only_return_standard_out=False):
+        yield {"test_item_embeddings": self._items}, None
+
+
+def test_single_pass_item_states_reorders_to_raw_columns():
+    xai = ExplainerPFN(
+        task_mode="single-pass", use_item_states=True, features_per_group=1
+    )
+    xai.model_ = _FakeModel(8)
+    xai.model_.features_per_group = 1
+    xai.device_ = torch.device("cpu")
+    xai.use_autocast_ = False
+    xai.item_mapping_ = np.array([2, 0])  # raw0 <- pre2, raw1 <- pre0
+
+    n, f, e = 5, 3, 8
+    items = torch.arange(n * f * e, dtype=torch.float32).reshape(n, 1, f, e)
+    xai.executor_ = [_FakeExecutor(items)]
+
+    out = xai._single_pass_item_states(np.zeros((n, 2)), np.zeros(n))
+    assert out.shape == (n, 2, e)
+    assert torch.equal(out[:, 0], items[:, 0, 2])
+    assert torch.equal(out[:, 1], items[:, 0, 0])
+
+
+def test_predict_single_pass_passes_item_states_prior_and_confidence(
+    monkeypatch,
+):
+    xai = _prepared_single_pass(monkeypatch)
+    xai.use_item_states = True
+    xai.use_linear_prior = True
+    xai.head_ = _v4_head()
+    xai.linear_prior_coef_ = np.array([1.0, -2.0, 0.5])
+    xai.linear_prior_mean_ = np.array([0.0, 0.0, 0.0])
+    xai.linear_prior_r2_ = 0.42
+    xai.feature_exp_std_ = 2.0
+
+    captured = {}
+
+    def fake_items(X, y, mapping=None):
+        t = torch.zeros(len(X), 3, 8)
+        captured["shape"] = tuple(t.shape)
+        return t
+
+    monkeypatch.setattr(xai, "_single_pass_item_states", fake_items)
+    original = xai.head_.forward
+
+    def wrapped(emb, feat, score, prior=None, confidence=None):
+        captured["emb"] = tuple(emb.shape)
+        captured["conf"] = None if confidence is None else confidence.clone()
+        return original(emb, feat, score, prior, confidence)
+
+    monkeypatch.setattr(xai.head_, "forward", wrapped)
+    out = xai.predict(np.zeros((4, 3)), np.zeros(4))
+
+    assert out.shape == (4, 3)
+    assert captured["shape"] == (4, 3, 8)
+    assert captured["emb"] == (4, 3, 8)  # not expanded from a row embedding
+    assert float(captured["conf"][0]) == pytest.approx(0.42)
+
+
+def test_save_foundation_model_records_v4_layout(tmp_path):
+    xai = ExplainerPFN(
+        task_mode="single-pass",
+        features_per_group=1,
+        use_item_states=True,
+    )
+    xai.model_ = _FakeModel(8)
+    xai.config_ = _FakeConfig(8)
+    xai.head_ = _v4_head()
+    xai.head_config_ = xai.head_.config()
+
+    path = tmp_path / "v4.ckp"
+    xai.save_foundation_model(path)
+    ckpt = torch.load(path, weights_only=False)
+    assert ckpt["features_per_group"] == 1
+    assert ckpt["use_item_states"] is True
+    assert ckpt["head_config"]["residual"] is True
+
+    restored = ExplainerPFN()
+    restored.config_ = _FakeConfig(8)
+    restored.bardist_ = FullSupportBarDistribution(torch.linspace(-3.0, 3.0, 513))
+    restored.device_ = torch.device("cpu")
+    assert restored.load_attribution_head(path) is True
+    assert restored.features_per_group == 1
+    assert restored.use_item_states is True
+
+
+def test_predict_residual_correction_clamp(monkeypatch):
+    xai = _prepared_single_pass(monkeypatch)
+    xai.use_item_states = True
+    xai.use_linear_prior = True
+    xai.correction_clamp = 0.5
+    xai.head_ = _v4_head()
+    xai.linear_prior_coef_ = np.array([1.0, 1.0, 1.0])
+    xai.linear_prior_mean_ = np.zeros(3)
+    xai.linear_prior_r2_ = 0.5
+    xai.feature_exp_std_ = 1.0
+    monkeypatch.setattr(
+        xai,
+        "_single_pass_item_states",
+        lambda X, y, mapping=None: torch.zeros(len(X), 3, 8),
+    )
+
+    X = np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
+    prior = X.copy()  # (X - 0) * 1 / std(1)
+
+    def fake_forward(emb, feat, score, prior=None, confidence=None):
+        return prior + torch.full_like(prior, 100.0)
+
+    monkeypatch.setattr(xai.head_, "forward", fake_forward)
+    out = xai.predict(X, np.zeros(2))
+
+    corr = out - prior
+    np.testing.assert_allclose(
+        np.linalg.norm(corr, axis=1),
+        0.5 * np.linalg.norm(prior, axis=1),
+        rtol=1e-4,
+    )
+

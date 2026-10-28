@@ -49,6 +49,7 @@ from explainerpfn.utils import (
     additive_correction,
     multiplicative_correction,
     statistical_correction,
+    fit_item_mapping,
 )
 
 
@@ -265,6 +266,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
         joint_head: bool = False,
         head_kwargs: dict | None = None,
         task_mode: Literal["explanation", "single-pass"] = "explanation",
+        use_linear_prior: bool = False,
+        features_per_group: int | None = None,
+        use_item_states: bool = False,
+        correction_clamp: float | None = None,
     ):
         self.n_estimators = n_estimators
         self.categorical_features_indices = categorical_features_indices
@@ -281,6 +286,24 @@ class ExplainerPFN:  # (TabPFNRegressor):
         if task_mode not in ("explanation", "single-pass"):
             raise ValueError(f"Unknown task_mode: {task_mode!r}")
         self.task_mode = task_mode
+        self.use_linear_prior = bool(use_linear_prior)
+        if features_per_group is not None:
+            features_per_group = int(features_per_group)
+            if features_per_group < 1:
+                raise ValueError("features_per_group must be >= 1")
+        self.features_per_group = features_per_group
+        self.use_item_states = bool(use_item_states)
+        if correction_clamp is not None and float(correction_clamp) <= 0:
+            raise ValueError("correction_clamp must be > 0 or None")
+        # Optional safety bound on the residual head's correction: the
+        # correction's per-row norm may not exceed clamp * ||prior||.
+        self.correction_clamp = (
+            None if correction_clamp is None else float(correction_clamp)
+        )
+        if self.use_item_states and task_mode != "single-pass":
+            raise ValueError(
+                "use_item_states requires task_mode='single-pass'"
+            )
         # Populated by ``initialize_attribution_head`` / ``_initialize_model_variables``.
         self.head_ = None
         self.head_config_ = None
@@ -430,6 +453,9 @@ class ExplainerPFN:  # (TabPFNRegressor):
             byte_size,
         ) = determine_precision(self.inference_precision, self.device_)
         self.model_.to(self.device_)
+        if self.features_per_group is not None:
+            # Layout override: 1 = one encoder item per feature (no grouping).
+            self.model_.features_per_group = int(self.features_per_group)
 
         # Build the interface_config
         _config = ModelInterfaceConfig.from_user_input(
@@ -458,6 +484,10 @@ class ExplainerPFN:  # (TabPFNRegressor):
                 # a freshly initialized head when ``joint_head=True``.
                 loaded_head = self.load_attribution_head(self.model_path)
                 if loaded_head:
+                    # The checkpoint's head architecture is authoritative.
+                    self.use_linear_prior = bool(
+                        getattr(self.head_, "use_prior", False)
+                    )
                     logger.info(
                         "Loaded attribution head from %s", self.model_path
                     )
@@ -488,6 +518,7 @@ class ExplainerPFN:  # (TabPFNRegressor):
         kwargs.setdefault(
             "output", "scalar" if self.task_mode == "single-pass" else "distribution"
         )
+        kwargs.setdefault("use_prior", self.use_linear_prior)
         self.head_ = AttributionHead(**kwargs)
         self.head_config_ = self.head_.config()
 
@@ -516,6 +547,13 @@ class ExplainerPFN:  # (TabPFNRegressor):
             # Adopt the architecture recorded by the checkpoint so ``fit``
             # builds the matching executor even if the constructor defaulted.
             self.task_mode = task_mode
+        if checkpoint.get("features_per_group") is not None:
+            self.features_per_group = int(checkpoint["features_per_group"])
+            model = getattr(self, "model_", None)
+            if model is not None:
+                model.features_per_group = self.features_per_group
+        if "use_item_states" in checkpoint:
+            self.use_item_states = bool(checkpoint["use_item_states"])
         self.initialize_attribution_head(checkpoint.get("head_config"))
         self.head_.load_state_dict(checkpoint["head_state_dict"])
         self.head_.to(self.device_)
@@ -526,6 +564,49 @@ class ExplainerPFN:  # (TabPFNRegressor):
         if self.head_ is None:
             return None
         return self.head_.state_dict()
+
+    def _fit_linear_prior(self, X, y):
+        """Fit the OLS surrogate used as the per-slot prior (v3).
+
+        The resulting attribution is ``beta_j * (x_ij - mean_j)``, i.e. the
+        LinearSHAP value of the linear surrogate fitted on ``(X, y)``.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        design = np.column_stack([X, np.ones(len(X))])
+        coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+        self.linear_prior_coef_ = coef[:-1]
+        self.linear_prior_mean_ = X.mean(axis=0)
+
+    def _linear_prior(self, X) -> np.ndarray:
+        """LinearSHAP prior for ``X`` (target units, ``(n, d)``)."""
+        X = np.asarray(X, dtype=np.float64)
+        return (X - self.linear_prior_mean_) * self.linear_prior_coef_
+
+    @staticmethod
+    def _linear_r2_cv(X, y, n_splits: int = 5, random_state: int = 0) -> float:
+        """Cross-validated R^2 of the OLS surrogate (the prior's confidence)."""
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        n = len(X)
+        if n < 2 * n_splits:
+            return float("nan")
+        rng = np.random.default_rng(random_state)
+        folds = np.array_split(rng.permutation(n), n_splits)
+        sse = sst = 0.0
+        for k in range(n_splits):
+            te = folds[k]
+            tr = np.concatenate(
+                [folds[j] for j in range(n_splits) if j != k]
+            )
+            design = np.column_stack([X[tr], np.ones(len(tr))])
+            coef, *_ = np.linalg.lstsq(design, y[tr], rcond=None)
+            pred = X[te] @ coef[:-1] + coef[-1]
+            sse += float(((y[te] - pred) ** 2).sum())
+            sst += float(((y[te] - y[tr].mean()) ** 2).sum())
+        if sst <= 0:
+            return float("nan")
+        return 1.0 - sse / sst
 
     def _collect_feature_embeddings(self, X, y) -> torch.Tensor:
         """Per-feature backbone ``test_embeddings`` as ``(n, d, emb)``."""
@@ -562,6 +643,38 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # ``task_mode='single-pass'`` enforces a single estimator.
         return embeddings[0]
 
+    def _single_pass_item_states(self, X, y, mapping=None) -> torch.Tensor:
+        """Per-feature encoder-item states as ``(n, d, emb)`` (raw column order).
+
+        Requires ``features_per_group=1`` so each encoder item is exactly one
+        preprocessed feature. The fitted ``item_mapping_`` maps preprocessed
+        columns back to raw feature order.
+        """
+        fpg = getattr(self.model_, "features_per_group", None)
+        if fpg != 1:
+            raise ValueError(
+                "per-feature item states require features_per_group=1; got "
+                f"{fpg}"
+            )
+        mapping = self.item_mapping_ if mapping is None else np.asarray(mapping)
+        if mapping is None:
+            raise ValueError("item mapping is not fitted; call fit() first")
+        X = self._prepare_predict_input(X)
+        embeddings = []
+        for output, _config in self.executor_[0].iter_outputs(
+            X,
+            y,
+            device=self.device_,
+            autocast=self.use_autocast_,
+            only_return_standard_out=False,
+        ):
+            items = output["test_item_embeddings"]
+            if items.ndim == 4:
+                items = items[:, 0, :, :]  # (s, b, f, e) -> (s, f, e)
+            embeddings.append(items[:, mapping, :])
+        # ``task_mode='single-pass'`` enforces a single estimator.
+        return embeddings[0]
+
     def _predict_joint(
         self,
         X,
@@ -585,9 +698,15 @@ class ExplainerPFN:  # (TabPFNRegressor):
             quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
         if self.task_mode == "single-pass":
-            # One forward: the row embedding is shared across feature slots.
-            emb = self._single_pass_embeddings(X, y)  # (n, emb)
-            embeddings = emb.unsqueeze(1).expand(-1, self.n_features_in_, -1)
+            if self.use_item_states:
+                # Per-feature encoder items: one forward, feature-specific slots.
+                embeddings = self._single_pass_item_states(X, y)  # (n, d, emb)
+            else:
+                # One forward: the row embedding is shared across feature slots.
+                emb = self._single_pass_embeddings(X, y)  # (n, emb)
+                embeddings = emb.unsqueeze(1).expand(
+                    -1, self.n_features_in_, -1
+                )
         else:
             embeddings = self._collect_feature_embeddings(X, y)
         features = np.asarray(
@@ -600,8 +719,44 @@ class ExplainerPFN:  # (TabPFNRegressor):
         score_t = torch.as_tensor(
             score, dtype=torch.float32, device=self.device_
         )
+        prior_t = None
+        if self.use_linear_prior:
+            prior_t = torch.as_tensor(
+                self._linear_prior(features) / self.feature_exp_std_,
+                dtype=torch.float32,
+                device=self.device_,
+            )
+        confidence_t = None
+        if getattr(self.head_, "use_confidence", False):
+            if self.linear_prior_r2_ is None:
+                raise ValueError(
+                    "head.use_confidence=True but no prior confidence is "
+                    "available; fit with use_linear_prior=True."
+                )
+            confidence_t = torch.full(
+                (features.shape[0],),
+                float(self.linear_prior_r2_),
+                dtype=torch.float32,
+                device=self.device_,
+            )
         with torch.inference_mode():
-            out = self.head_(embeddings, features_t, score_t)
+            out = self.head_(
+                embeddings, features_t, score_t, prior_t, confidence_t
+            )
+        if (
+            self.correction_clamp is not None
+            and getattr(self.head_, "residual", False)
+        ):
+            # Bound the correction relative to the prior (per row). When the
+            # prior is excellent this keeps the model close to it; when the
+            # prior is poor the correction is already small relative to it.
+            correction = out - prior_t
+            p_norm = prior_t.norm(dim=-1, keepdim=True)
+            c_norm = correction.norm(dim=-1, keepdim=True)
+            scale = torch.clamp(
+                self.correction_clamp * p_norm / (c_norm + 1e-12), max=1.0
+            )
+            out = prior_t + correction * scale
 
         scale = self.feature_exp_std_
 
@@ -661,11 +816,47 @@ class ExplainerPFN:  # (TabPFNRegressor):
         self.X_ = X
         self.y_ = y
 
+        if self.use_linear_prior:
+            if self.task_mode != "single-pass":
+                raise ValueError(
+                    "use_linear_prior is only supported with "
+                    "task_mode='single-pass'."
+                )
+            self._fit_linear_prior(X, y)
+        else:
+            self.linear_prior_coef_ = None
+            self.linear_prior_mean_ = None
+
+        if self.use_item_states and self.task_mode != "single-pass":
+            raise ValueError(
+                "use_item_states is only supported with "
+                "task_mode='single-pass'."
+            )
+        if self.use_item_states and self.features_per_group is None:
+            # Ungrouped layout is required for one encoder item per feature.
+            self.features_per_group = 1
+            if getattr(self, "model_", None) is not None:
+                self.model_.features_per_group = 1
+
+        # Confidence scalar attached to the prior (CV R^2 of the OLS fit).
+        self.linear_prior_r2_ = (
+            self._linear_r2_cv(X, y) if self.use_linear_prior else None
+        )
+
         # TODO: handle constant targets
 
         # TODO: Check if there's a way to improve this
         self.y_train_std_ = np.std(y) + 1e-20
-        self.feature_exp_std_ = self.y_train_std_  # / np.sqrt(X.shape[1])
+        if self.use_linear_prior:
+            # The prior is an explanation in target units, so its std is a
+            # direct estimate of the attribution scale (unlike std(y), which
+            # overstates it by roughly sqrt(d)). Using it also makes the
+            # prior channel scale-consistent between train and inference.
+            self.feature_exp_std_ = (
+                float(np.std(self._linear_prior(X))) + 1e-20
+            )
+        else:
+            self.feature_exp_std_ = self.y_train_std_  # / np.sqrt(X.shape[1])
         self.base_value_ = np.mean(y).item()
         # mean, std = np.mean(y), np.std(y)
         # self.y_train_std_ = std.item() + 1e-20
@@ -699,6 +890,14 @@ class ExplainerPFN:  # (TabPFNRegressor):
             self.executor_ = InferenceEngineCachePreprocessing.prepare(
                 **executor_kwargs
             )
+
+        if self.use_item_states:
+            # Map preprocessed encoder columns back to raw feature order.
+            self.item_mapping_ = fit_item_mapping(
+                self.X_, np.asarray(self.executor_[0].X_trains[0])
+            )
+        else:
+            self.item_mapping_ = None
 
         return self
 
@@ -1141,6 +1340,8 @@ class ExplainerPFN:  # (TabPFNRegressor):
             checkpoint["head_config"] = self.head_config_
         # Record the backbone task construction so the file is self-describing.
         checkpoint["task_mode"] = self.task_mode
+        checkpoint["features_per_group"] = self.features_per_group
+        checkpoint["use_item_states"] = self.use_item_states
 
         # Save the checkpoint
         torch.save(checkpoint, path)

@@ -248,6 +248,9 @@ def test_iterator_batch_contract():
         "X",
         "y",
         "shap",
+        "prior",
+        "prior_r2",
+        "item_mapping",
         "executor_configs",
         "feature_exp_std",
         "dataset_index",
@@ -256,11 +259,67 @@ def test_iterator_batch_contract():
     n_samples, n_features = batch["X"].shape
     assert batch["y"].shape == (n_samples,)
     assert batch["shap"].shape == (n_samples, n_features)
+    assert batch["prior"] is None  # only built for single-pass prior runs
+    assert batch["prior_r2"] is None
+    assert batch["item_mapping"] is None
     assert len(batch["executor_configs"]) == n_features
     assert np.isfinite(batch["feature_exp_std"]) and batch["feature_exp_std"] > 0
     assert np.all(np.isfinite(batch["X"]))
     assert np.all(np.isfinite(batch["shap"]))
     assert batch["dataset_index"] == 0
+
+
+def test_iterator_prior_matches_linear_shap():
+    """The v3 prior is the normalized LinearSHAP of an OLS fit on (X, y)."""
+    gen = _small_gen(linear_dag_prob=1.0, n_samples_range=(128, 128))
+    it = TrainingBatchIterator(
+        generator=gen,
+        max_datasets=1,
+        prefetch=1,
+        task_mode="single-pass",
+        linear_prior=True,
+    )
+    try:
+        batch = it.next_batch()
+    finally:
+        it.close()
+
+    X, y = batch["X"], batch["y"]
+    assert batch["prior"].shape == X.shape
+    design = np.column_stack([X, np.ones(len(X))])
+    coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+    expected = ((X - X.mean(axis=0)) * coef[:-1]) / batch["feature_exp_std"]
+    np.testing.assert_allclose(batch["prior"], expected, atol=1e-8)
+    assert np.isfinite(batch["prior_r2"])
+    assert -1.0 <= batch["prior_r2"] <= 1.0
+
+
+def test_iterator_item_states_mapping():
+    """The v4 item mapping points at preprocessed columns that are monotone
+    recodes of the corresponding raw columns."""
+    gen = _small_gen(linear_dag_prob=1.0, n_samples_range=(128, 128))
+    it = TrainingBatchIterator(
+        generator=gen,
+        max_datasets=1,
+        prefetch=1,
+        task_mode="single-pass",
+        item_states=True,
+    )
+    try:
+        batch = it.next_batch()
+    finally:
+        it.close()
+
+    mapping = batch["item_mapping"]
+    X = batch["X"]
+    X_pre = np.asarray(batch["executor_configs"][0].X_trains[0])
+    assert mapping is not None
+    assert len(mapping) == X.shape[1]
+    assert len(set(mapping.tolist())) == X.shape[1]
+    for i, j in enumerate(mapping):
+        rank_a = np.argsort(np.argsort(X[:, i]))
+        rank_b = np.argsort(np.argsort(X_pre[:, j]))
+        assert abs(np.corrcoef(rank_a, rank_b)[0, 1]) > 0.999
 
 
 def test_iterator_start_index_resumes_stream():

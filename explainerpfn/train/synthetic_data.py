@@ -47,6 +47,7 @@ import numpy as np
 import pandas as pd
 
 from explainerpfn.train.dag_generators import DAGGenerator
+from explainerpfn.utils import fit_item_mapping
 
 __all__ = ["SyntheticDataGenerator", "TrainingBatchIterator"]
 
@@ -350,6 +351,8 @@ class TrainingBatchIterator:
         verbose=False,
         task_mode="explanation",
         permute_features=False,
+        linear_prior=False,
+        item_states=False,
     ):
         self.generator = generator if generator is not None else SyntheticDataGenerator()
         self.prefetch = max(1, int(prefetch))
@@ -362,6 +365,8 @@ class TrainingBatchIterator:
         self.verbose = verbose
         self.task_mode = task_mode
         self.permute_features = bool(permute_features)
+        self.linear_prior = bool(linear_prior)
+        self.item_states = bool(item_states)
 
         self._queue = queue.Queue(maxsize=self.prefetch)
         self._stop = threading.Event()
@@ -405,6 +410,16 @@ class TrainingBatchIterator:
             # skip it before paying for the throwaway preprocessing fit.
             return None
 
+        prior = None
+        prior_r2 = None
+        if self.task_mode == "single-pass" and self.linear_prior:
+            # LinearSHAP prior of an OLS surrogate fitted on (X, y). Computed
+            # after the column permutation, so slots stay aligned with X/shap.
+            design = np.column_stack([X, np.ones(len(X))])
+            coef, *_ = np.linalg.lstsq(design, y, rcond=None)
+            prior = ((X - X.mean(axis=0)) * coef[:-1]) / feature_exp_std
+            prior_r2 = ExplainerPFN._linear_r2_cv(X, y)
+
         xai = ExplainerPFN(
             fit_mode="low_memory",
             random_state=self.random_state,
@@ -412,6 +427,17 @@ class TrainingBatchIterator:
             task_mode=self.task_mode,
         )
         xai.fit(X, y)
+        item_mapping = None
+        if self.task_mode == "single-pass" and self.item_states:
+            # With features_per_group=1 the encoder emits one item per
+            # preprocessed feature; map those back to raw column order.
+            try:
+                item_mapping = fit_item_mapping(
+                    xai.X_, np.asarray(xai.executor_[0].X_trains[0])
+                )
+            except ValueError:
+                # Unalignable columns (e.g. dropped constants): skip dataset.
+                return None
         # Drop the fitted model; keep only the preprocessing executor configs.
         del xai.model_
         for executor in xai.executor_:
@@ -424,6 +450,9 @@ class TrainingBatchIterator:
             "X": X,
             "y": y,
             "shap": shap,
+            "prior": prior,
+            "prior_r2": prior_r2,
+            "item_mapping": item_mapping,
             "executor_configs": xai.executor_,
             "feature_exp_std": feature_exp_std,
             # Provenance: lets the trainer persist the exact dataset index so a
