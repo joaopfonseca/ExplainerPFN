@@ -240,6 +240,30 @@ def default_explanation_preprocessor_configs() -> list[PreprocessorConfig]:
     ]
 
 
+def strict_item_preprocessor_configs() -> list[PreprocessorConfig]:
+    """Preprocessor configuration for an exact one-item-per-feature layout.
+
+    The single-pass attribution head consumes one encoder-item state per raw
+    feature, so the preprocessing must keep the input dimensionality and the
+    column order unchanged:
+
+    * no global transformer (SVD components would append mixed, unattributable
+      columns and shift ``n_items`` past ``n_features``);
+    * plain ordinal encoding (shuffled codes break the monotone per-column
+      correspondence between raw and preprocessed values);
+    * no feature subsampling or append-to-original (both change the width).
+    """
+    return [
+        PreprocessorConfig(
+            "robust",
+            append_original=False,
+            subsample_features=-1,
+            categorical_name="ordinal",
+            global_transformer_name=None,
+        ),
+    ]
+
+
 def generate_index_permutations(
     n: int,
     *,
@@ -311,6 +335,7 @@ class EnsembleConfig:
         preprocessor_configs: Sequence[PreprocessorConfig],
         target_transforms: Sequence[TransformerMixin | Pipeline | None],
         random_state: int | np.random.Generator | None,
+        remove_constant_features: bool = True,
     ) -> list[ExplainerEnsembleConfig]:
         """Generate ensemble configurations for regression.
 
@@ -327,6 +352,8 @@ class EnsembleConfig:
             preprocessor_configs: Preprocessor configurations to use on the data.
             target_transforms: Target transformations to apply.
             random_state: Random number generator.
+            remove_constant_features: Drop constant columns (default). Disable
+                for the exact one-item-per-feature layout.
 
         Returns:
             List of ensemble configurations.
@@ -373,6 +400,7 @@ class EnsembleConfig:
                 feature_shift_decoder=feature_shift_decoder,
                 subsample_ix=subsample_ix,
                 target_transform=target_transform,
+                remove_constant_features=remove_constant_features,
             )
             for featshift, subsample_ix, (preprocess_config, target_transform) in zip(
                 featshifts,
@@ -413,7 +441,11 @@ class EnsembleConfig:
             )
 
         # TODO: Remove this step
-        steps.append(RemoveConstantFeaturesStep())
+        if getattr(self, "remove_constant_features", True):
+            # Dropping constant columns changes the input width. The exact
+            # one-item-per-feature layout disables that so encoder item ``j``
+            # is always raw feature ``j``.
+            steps.append(RemoveConstantFeaturesStep())
 
         if self.preprocess_config.differentiable:
             steps.append(DifferentiableZNormStep())
@@ -440,13 +472,17 @@ class EnsembleConfig:
         if self.add_fingerprint_feature:
             steps.append(AddFingerprintFeaturesStep(random_state=random_state))
 
-        steps.append(
-            ShuffleFeaturesStep(
-                shuffle_method=self.feature_shift_decoder,
-                shuffle_index=self.feature_shift_count,
-                random_state=random_state,
-            ),
-        )
+        if self.feature_shift_decoder is not None:
+            # ``None`` means the identity order (the single-pass task applies
+            # any order augmentation upstream, with the SHAP targets permuted
+            # identically), so the step is a no-op and is skipped.
+            steps.append(
+                ShuffleFeaturesStep(
+                    shuffle_method=self.feature_shift_decoder,
+                    shuffle_index=self.feature_shift_count,
+                    random_state=random_state,
+                ),
+            )
         return SequentialFeatureTransformer(steps)
 
 
@@ -454,10 +490,18 @@ class EnsembleConfig:
 class ExplainerEnsembleConfig(EnsembleConfig):
     """Configuration for a regression ensemble member.
 
-    See [EnsembleConfig][tabpfn.preprocessing.EnsembleConfig] for more details.
+    See [tabpfn.preprocessing.EnsembleConfig][tabpfn.preprocessing.EnsembleConfig]
+    for more details.
+
+    Attributes:
+        target_transform: Target transform applied to ``y``.
+        remove_constant_features: Drop columns that are constant on the
+            training data. Disable for the exact one-item-per-feature layout,
+            where the input width must equal the number of raw features.
     """
 
     target_transform: TransformerMixin | Pipeline | None
+    remove_constant_features: bool = True
 
 
 def fit_preprocessing_one(
