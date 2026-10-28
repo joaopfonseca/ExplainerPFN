@@ -601,6 +601,12 @@ class PerFeatureTransformer(nn.Module):
             train_encoder_out = encoder_out[:, :single_eval_pos, -1].transpose(0, 1)
             output_decoded["train_embeddings"] = train_encoder_out
             output_decoded["test_embeddings"] = test_encoder_out
+            # Per-item (per-feature-group) states for the query rows. With
+            # ``features_per_group=1`` each item is exactly one feature, which
+            # is what the per-feature attribution head conditions on.
+            output_decoded["test_item_embeddings"] = encoder_out[
+                :, single_eval_pos:, :-1
+            ].transpose(0, 1)
 
         return output_decoded
 

@@ -274,3 +274,68 @@ def statistical_correction(
     explanations_corrected /= explanations.std()
     explanations_corrected *= y_test.std() / np.sqrt(explanations.shape[1])
     return explanations_corrected
+
+
+def _column_match_score(a: np.ndarray, b: np.ndarray) -> float:
+    """Similarity of two columns under monotone recoding, in [0, 1]."""
+    if a.std() < 1e-12 or b.std() < 1e-12:
+        return 1.0 if np.allclose(a, b) else -np.inf
+    pearson = abs(float(np.corrcoef(a, b)[0, 1]))
+    rank_a = np.argsort(np.argsort(a)).astype(np.float64)
+    rank_b = np.argsort(np.argsort(b)).astype(np.float64)
+    spearman = abs(float(np.corrcoef(rank_a, rank_b)[0, 1]))
+    return max(pearson, spearman)
+
+
+
+def fit_item_mapping(X_raw, X_pre, threshold: float = 0.999) -> np.ndarray:
+    """Map raw feature columns to preprocessed encoder-item columns.
+
+    Matching uses Pearson and Spearman correlation, so monotone recodes (power
+    transforms, ordinal encoding) still match. Returns ``mapping`` with
+    ``mapping[i]`` the preprocessed column for raw column ``i``. Raises if a
+    raw column cannot be matched, because silent misalignment would corrupt
+    the attributions.
+
+    NOTE: the TabPFN pipeline can expand a raw column into several preprocessed
+    columns and can shuffle ordinal category codes (destroying monotonicity);
+    in those cases this value-based matching is approximate. A dedicated 1:1
+    preprocessing mode is required for exact per-feature alignment.
+    """
+    X_raw = np.asarray(X_raw, dtype=np.float64)
+    X_pre = np.asarray(X_pre, dtype=np.float64)
+    if X_raw.ndim != 2 or X_pre.ndim != 2:
+        raise ValueError("fit_item_mapping expects 2-D arrays")
+    if X_raw.shape[0] != X_pre.shape[0]:
+        raise ValueError(
+            f"row count mismatch: raw {X_raw.shape[0]} vs preprocessed "
+            f"{X_pre.shape[0]}"
+        )
+
+    n_raw, n_pre = X_raw.shape[1], X_pre.shape[1]
+    scores = np.full((n_raw, n_pre), -np.inf)
+    for i in range(n_raw):
+        for j in range(n_pre):
+            scores[i, j] = _column_match_score(X_raw[:, i], X_pre[:, j])
+
+    mapping = np.full(n_raw, -1, dtype=int)
+    used: set[int] = set()
+    order = np.dstack(
+        np.unravel_index(np.argsort(scores, axis=None)[::-1], scores.shape)
+    )[0]
+    for i, j in order:
+        i, j = int(i), int(j)
+        if mapping[i] != -1 or j in used:
+            continue
+        if scores[i, j] < threshold:
+            continue
+        mapping[i] = j
+        used.add(j)
+
+    unmatched = [i for i in range(n_raw) if mapping[i] == -1]
+    if unmatched:
+        raise ValueError(
+            "could not match raw feature columns to preprocessed items: "
+            f"{unmatched} (raw d={n_raw}, preprocessed d={n_pre})"
+        )
+    return mapping

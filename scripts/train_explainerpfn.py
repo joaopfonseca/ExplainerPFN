@@ -146,6 +146,8 @@ def save_checkpoint(
         "rng_state": rng.bit_generator.state,
         "config": vars(args),
         "task_mode": getattr(args, "task_mode", "explanation"),
+        "features_per_group": getattr(xai, "features_per_group", None),
+        "use_item_states": getattr(xai, "use_item_states", False),
     }
     if getattr(xai, "head_", None) is not None:
         payload["head_state_dict"] = xai.head_state_dict()
@@ -374,8 +376,59 @@ def parse_args(argv=None):
         "training dataset, permuting the SHAP targets identically (order "
         "augmentation; alignment is preserved by construction).",
     )
+    sp.add_argument(
+        "--linear-prior",
+        action="store_true",
+        default=False,
+        help="Single-pass only (v3): feed the LinearSHAP attribution of an OLS "
+        "surrogate fitted on (X, p_hat) as an extra per-slot head input, so "
+        "the head learns to correct the prior rather than produce "
+        "attributions from scratch.",
+    )
+    sp.add_argument(
+        "--prior-confidence",
+        action="store_true",
+        default=False,
+        help="Feed the prior's cross-validated R^2 as a per-dataset confidence "
+        "input so the head can calibrate how much to trust it.",
+    )
+    sp.add_argument(
+        "--residual",
+        action="store_true",
+        default=False,
+        help="Head predicts a correction around the prior (zero-initialised "
+        "output layer, so training starts exactly at the prior).",
+    )
+    sp.add_argument(
+        "--item-states",
+        action="store_true",
+        default=False,
+        help="Single-pass only (v4): feed per-feature encoder-item states to "
+        "the head instead of a single replicated row embedding. Requires the "
+        "encoder to be ungrouped (--features-per-group 1).",
+    )
+    sp.add_argument(
+        "--features-per-group",
+        type=int,
+        default=None,
+        help="Override the encoder's feature grouping (1 = one item per "
+        "feature). Default: keep the checkpoint's value.",
+    )
 
     args = p.parse_args(argv)
+
+    if args.linear_prior and args.task_mode != "single-pass":
+        p.error("--linear-prior requires --task-mode single-pass")
+    if args.permute_features and args.task_mode != "single-pass":
+        p.error("--permute-features requires --task-mode single-pass")
+    if args.prior_confidence and not args.linear_prior:
+        p.error("--prior-confidence requires --linear-prior")
+    if args.residual and not args.linear_prior:
+        p.error("--residual requires --linear-prior")
+    if args.item_states and args.task_mode != "single-pass":
+        p.error("--item-states requires --task-mode single-pass")
+    if args.item_states and args.features_per_group != 1:
+        p.error("--item-states requires --features-per-group 1")
 
     # Normalise tuple-like args and record the exact resume-relevant data config.
     args.n_features_range = tuple(args.n_features_range)
@@ -423,6 +476,8 @@ def make_data_iterator(args, start_index=0):
         verbose=False,
         task_mode=getattr(args, "task_mode", "explanation"),
         permute_features=getattr(args, "permute_features", False),
+        linear_prior=getattr(args, "linear_prior", False),
+        item_states=getattr(args, "item_states", False),
     )
 
 
@@ -449,6 +504,8 @@ def train(args, logger):
         "n_layers": args.head_n_layers,
         "nhead": args.head_nhead,
         "max_features": args.head_max_features or args.n_features_range[1],
+        "use_confidence": args.prior_confidence,
+        "residual": args.residual,
     }
     xai = ExplainerPFN(
         fit_mode="low_memory",
@@ -458,6 +515,9 @@ def train(args, logger):
         joint_head=args.joint_head or args.task_mode == "single-pass",
         head_kwargs=head_kwargs,
         task_mode=args.task_mode,
+        use_linear_prior=args.linear_prior,
+        features_per_group=args.features_per_group,
+        use_item_states=args.item_states,
     )
     xai._initialize_model_variables()
     xai.model_.train()
@@ -579,25 +639,58 @@ def train(args, logger):
                 executor_configs = batch["executor_configs"]
 
                 if args.task_mode == "single-pass":
-                    # One backbone forward over the whole dataset; every
-                    # feature's attribution comes from the shared row embedding.
+                    # One backbone forward over the whole dataset.
                     xai.executor_ = executor_configs
                     xai.executor_[0].model = xai.model_
                     xai.executor_[0].use_torch_inference_mode(False)
-                    with torch.enable_grad():
-                        emb = xai._single_pass_embeddings(X_batch, y_batch)
                     n_rows = X_batch.shape[0]
                     n_feats = X_batch.shape[1]
-                    embeddings = emb.view(n_rows, 1, -1).expand(
-                        -1, n_feats, -1
-                    )
+                    with torch.enable_grad():
+                        if args.item_states:
+                            # Per-feature encoder items (v4).
+                            embeddings = xai._single_pass_item_states(
+                                X_batch, y_batch,
+                                mapping=batch.get("item_mapping"),
+                            )
+                        else:
+                            emb = xai._single_pass_embeddings(
+                                X_batch, y_batch
+                            )
+                            embeddings = emb.view(n_rows, 1, -1).expand(
+                                -1, n_feats, -1
+                            )
                     features_t = torch.tensor(
                         X_batch, dtype=torch.float32, device=xai.device_
                     )
                     score_t = torch.tensor(
                         y_batch, dtype=torch.float32, device=xai.device_
                     )
-                    pred = xai.head_(embeddings, features_t, score_t)  # (n, d)
+                    prior_t = None
+                    if args.linear_prior:
+                        prior = batch.get("prior")
+                        if prior is None:
+                            raise RuntimeError(
+                                "--linear-prior was requested but the batch "
+                                "iterator did not produce a prior."
+                            )
+                        prior_t = torch.tensor(
+                            prior, dtype=torch.float32, device=xai.device_
+                        )
+                    conf_t = None
+                    if args.prior_confidence:
+                        conf = batch.get("prior_r2")
+                        if conf is None or not np.isfinite(conf):
+                            raise RuntimeError(
+                                "--prior-confidence was requested but the "
+                                "batch has no finite prior_r2."
+                            )
+                        conf_t = torch.full(
+                            (n_rows,), float(conf),
+                            dtype=torch.float32, device=xai.device_,
+                        )
+                    pred = xai.head_(
+                        embeddings, features_t, score_t, prior_t, conf_t
+                    )  # (n, d)
                     target = torch.tensor(
                         shap_batch / batch["feature_exp_std"],
                         dtype=torch.float32,
@@ -723,9 +816,10 @@ def train(args, logger):
             total_grad_norm = total_grad_norm**0.5
 
             if step_ok:
-                torch.nn.utils.clip_grad_norm_(
-                    trainable_params, args.max_grad_norm
-                )
+                if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params, args.max_grad_norm
+                    )
                 optimizer.step()
             if scheduler is not None:
                 scheduler.step()

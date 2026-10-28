@@ -108,6 +108,17 @@ class AttributionHead(nn.Module):
             deterministic training protocol).
         max_features: Largest number of feature slots (d) the slot embedding
             supports. Datasets with more features than this raise.
+        use_prior: If True, each slot also receives a cheap surrogate
+            attribution (e.g. LinearSHAP from a linear fit on ``(X, p_hat)``)
+            as an extra input channel. The head then learns to correct the
+            prior rather than produce attributions from scratch.
+        use_confidence: If True, each slot also receives a per-dataset
+            confidence scalar (e.g. the linear surrogate's cross-validated
+            R^2), letting the head calibrate how much to trust the prior.
+        residual: If True (requires ``use_prior`` and ``output='scalar'``), the
+            head predicts a *correction* and returns ``prior + correction``.
+            The output layer is zero-initialised, so training starts exactly at
+            the prior.
     """
 
     def __init__(
@@ -121,6 +132,9 @@ class AttributionHead(nn.Module):
         dropout: float = 0.0,
         max_features: int = 15,
         output: Literal["distribution", "scalar"] = "distribution",
+        use_prior: bool = False,
+        use_confidence: bool = False,
+        residual: bool = False,
     ):
         super().__init__()
         hidden_dim = int(hidden_dim or emb_dim)
@@ -130,6 +144,10 @@ class AttributionHead(nn.Module):
             )
         if output not in ("distribution", "scalar"):
             raise ValueError(f"Unknown output mode: {output!r}")
+        if residual and not use_prior:
+            raise ValueError("residual=True requires use_prior=True")
+        if residual and output != "scalar":
+            raise ValueError("residual=True requires output='scalar'")
         self.emb_dim = int(emb_dim)
         self.n_buckets = int(n_buckets)
         self.hidden_dim = hidden_dim
@@ -138,9 +156,19 @@ class AttributionHead(nn.Module):
         self.dropout = float(dropout)
         self.max_features = int(max_features)
         self.output = output
+        self.use_prior = bool(use_prior)
+        self.use_confidence = bool(use_confidence)
+        self.residual = bool(residual)
 
         # Per-slot token: [h_j (emb_dim), x_j (1), score (1)] -> hidden.
-        self.token_proj = nn.Linear(emb_dim + 2, hidden_dim)
+        # Optional extra channels: surrogate attribution, confidence scalar.
+        n_inputs = (
+            emb_dim
+            + 2
+            + (1 if self.use_prior else 0)
+            + (1 if self.use_confidence else 0)
+        )
+        self.token_proj = nn.Linear(n_inputs, hidden_dim)
         self.slot_embedding = nn.Parameter(
             torch.zeros(max_features, hidden_dim)
         )
@@ -163,6 +191,11 @@ class AttributionHead(nn.Module):
             hidden_dim, 1 if self.output == "scalar" else self.n_buckets
         )
         nn.init.zeros_(self.out_proj.bias)
+        if self.residual:
+            # Zero-initialise so the model starts exactly at the prior and
+            # only learns corrections.
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
 
     # ------------------------------------------------------------------
     # Config / construction
@@ -179,6 +212,9 @@ class AttributionHead(nn.Module):
             "dropout": self.dropout,
             "max_features": self.max_features,
             "output": self.output,
+            "use_prior": self.use_prior,
+            "use_confidence": self.use_confidence,
+            "residual": self.residual,
         }
 
     @classmethod
@@ -194,6 +230,8 @@ class AttributionHead(nn.Module):
         embeddings: torch.Tensor,
         features: torch.Tensor,
         score: torch.Tensor,
+        prior: torch.Tensor | None = None,
+        confidence: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict all features' attribution-bucket logits jointly.
 
@@ -202,11 +240,16 @@ class AttributionHead(nn.Module):
                 backbone representations (``test_embeddings``).
             features: ``(n_samples, n_features)`` raw query feature values.
             score: ``(n_samples,)`` or ``(n_samples, 1)`` model score.
+            prior: Optional ``(n_samples, n_features)`` surrogate attribution
+                (e.g. LinearSHAP). Required iff ``use_prior`` is True.
+            confidence: Optional ``(n_samples,)`` or ``(n_samples, 1)``
+                per-dataset trust scalar. Required iff ``use_confidence``.
 
         Returns:
             ``(n_samples, n_features, n_buckets)`` logits for
             ``output="distribution"``, or ``(n_samples, n_features)`` point
-            estimates for ``output="scalar"``.
+            estimates for ``output="scalar"``. With ``residual`` the point
+            estimates are ``prior + correction``.
         """
         if embeddings.ndim != 3:
             raise ValueError(
@@ -222,16 +265,40 @@ class AttributionHead(nn.Module):
                 f"n_features={n_features} exceeds max_features="
                 f"{self.max_features}"
             )
+        if self.use_prior and prior is None:
+            raise ValueError("head.use_prior=True but no prior was provided")
+        if not self.use_prior and prior is not None:
+            raise ValueError("prior provided but head.use_prior=False")
+        if self.use_confidence and confidence is None:
+            raise ValueError(
+                "head.use_confidence=True but no confidence was provided"
+            )
+        if not self.use_confidence and confidence is not None:
+            raise ValueError(
+                "confidence provided but head.use_confidence=False"
+            )
 
         score = score.reshape(n_samples, 1).expand(n_samples, n_features).unsqueeze(-1)
         features = features.reshape(n_samples, n_features, 1)
 
-        tokens = torch.cat([embeddings, features, score], dim=-1)
+        channels = [embeddings, features, score]
+        if self.use_prior:
+            channels.append(prior.reshape(n_samples, n_features, 1))
+        if self.use_confidence:
+            channels.append(
+                confidence.reshape(n_samples, 1)
+                .expand(n_samples, n_features)
+                .unsqueeze(-1)
+            )
+        tokens = torch.cat(channels, dim=-1)
         tokens = self.token_proj(tokens)
         tokens = tokens + self.slot_embedding[:n_features].unsqueeze(0)
 
         mixed = self.mixer(tokens)  # (n, d, hidden)
         out = self.out_proj(mixed)  # (n, d, n_buckets) or (n, d, 1)
         if self.output == "scalar":
-            return out.squeeze(-1)  # (n, d) point estimates
+            point = out.squeeze(-1)  # (n, d) point estimates
+            if self.residual:
+                return prior + point  # correction around the prior
+            return point
         return out

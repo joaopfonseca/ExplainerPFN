@@ -100,6 +100,28 @@ def main():
         default=None,
         help="Optional subset of dataset names (default: all in the pickle).",
     )
+    parser.add_argument(
+        "--correction-clamp",
+        type=float,
+        default=None,
+        help="Residual models only: bound each row's correction norm to "
+        "clamp * ||prior|| (safety against over-correction).",
+    )
+    parser.add_argument(
+        "--order-ensemble",
+        type=int,
+        default=1,
+        help="Average predictions over this many random feature-column orders "
+        "(fit and predict are re-run per order; outputs are un-permuted "
+        "before averaging). 1 = disabled.",
+    )
+    parser.add_argument(
+        "--corrections",
+        nargs="*",
+        default=["statistical", "additive"],
+        help="Explanation corrections applied before scoring, matching the "
+        "paper protocol. Use 'none' to score raw predictions.",
+    )
     args = parser.parse_args()
 
     models = []
@@ -133,20 +155,39 @@ def main():
         for label, model_path in models:
             corr = jac = float("nan")
             try:
-                xai = ExplainerPFN(
-                    model_path=model_path,
-                    random_state=args.random_state,
-                    device=args.device,
-                    inference_precision=inference_precision,
-                )
-                xai.fit(X_fit, y_fit)
-                # A joint head embedded in the checkpoint is auto-loaded by
-                # ``fit``; ``--mode joint`` on a headless checkpoint raises a
-                # clear error from ``predict``.
-                exp = xai.predict(X_test, y_test, mode=args.mode)
-                corrected = xai.apply_correction(
-                    y_test, exp, kind=["statistical", "additive"]
-                )
+                n_feat = X_test.shape[1]
+                preds = []
+                for order_idx in range(max(1, args.order_ensemble)):
+                    if args.order_ensemble <= 1:
+                        perm = np.arange(n_feat)
+                    else:
+                        perm = np.random.default_rng(
+                            args.random_state + order_idx
+                        ).permutation(n_feat)
+                    inv = np.argsort(perm)
+                    xai = ExplainerPFN(
+                        model_path=model_path,
+                        random_state=args.random_state,
+                        device=args.device,
+                        inference_precision=inference_precision,
+                        correction_clamp=args.correction_clamp,
+                    )
+                    xai.fit(X_fit[:, perm], y_fit)
+                    # A joint head embedded in the checkpoint is auto-loaded
+                    # by ``fit``; ``--mode joint`` on a headless checkpoint
+                    # raises a clear error from ``predict``.
+                    preds.append(
+                        xai.predict(X_test[:, perm], y_test, mode=args.mode)[
+                            :, inv
+                        ]
+                    )
+                exp = preds[0] if len(preds) == 1 else np.mean(preds, axis=0)
+                if args.corrections == ["none"]:
+                    corrected = exp
+                else:
+                    corrected = xai.apply_correction(
+                        y_test, exp, kind=args.corrections
+                    )
                 corr = _safe_corr(corrected, shap_ref)
                 jac = float(
                     np.mean(
