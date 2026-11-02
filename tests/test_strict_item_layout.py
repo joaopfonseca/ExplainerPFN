@@ -9,7 +9,10 @@ encoding it depends on.
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from tabpfn.utils import _fix_dtypes, _get_ordinal_encoder
+
+from explainerpfn.model.encoders import normalize_data, torch_nanstd
 
 from explainerpfn.preprocessing import (
     EnsembleConfig,
@@ -155,3 +158,30 @@ def test_process_text_na_dataframe_matches_encoder_on_transform():
     encoded = process_text_na_dataframe(X_test, ord_encoder=encoder)
     assert _rank_corr(encoded[:, 0], df_test["cat0"].to_numpy()) > 0.999
     assert np.allclose(encoded[:, 1], df_test["num0"].to_numpy())
+
+
+def test_constant_feature_has_finite_normalization_gradients():
+    """Keeping a constant column must not produce NaN gradients.
+
+    ``torch_nanstd`` takes ``sqrt(0)`` for a constant feature, whose derivative
+    is infinite; multiplied by the zero downstream gradient this becomes NaN and
+    poisons every parameter of the model.
+    """
+    torch.manual_seed(0)
+    base = torch.randn(64, 1, 3)
+    const = torch.full((64, 1, 1), 3.0)
+    x = torch.cat([base, const], dim=-1).requires_grad_(True)
+
+    out = normalize_data(x, normalize_positions=32)
+    # Forward is unchanged: a constant feature normalizes to zero.
+    assert torch.equal(out[..., 3], torch.zeros(64, 1))
+    assert torch.isfinite(out).all()
+
+    out.sum().backward()
+    assert torch.isfinite(x.grad).all()
+
+    v = x.detach().clone().requires_grad_(True)
+    std = torch_nanstd(v[:32], axis=0)
+    assert torch.isfinite(std).all()
+    std.sum().backward()
+    assert torch.isfinite(v.grad).all()

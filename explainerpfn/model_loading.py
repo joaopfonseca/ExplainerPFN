@@ -85,6 +85,55 @@ def _reconstitute_foundation_checkpoint(
     }
 
 
+def _load_foundation_payload(
+    path: str | Path,
+    *,
+    which: Literal["regressor", "classifier"],
+    version: str,
+    download: bool,
+    _seen: set[Path] | None = None,
+) -> dict:
+    """Load a foundation-format payload from ``path``, following trainer chains.
+
+    A trainer checkpoint records the model it was fine-tuned from in
+    ``config["model_path"]``. That reference is usually a foundation checkpoint,
+    but a run initialised from another trainer checkpoint (e.g. v5 <- v4 <- stock)
+    records a trainer checkpoint instead. Resolve those links recursively so the
+    architecture config and bar distribution still come from the stock model.
+    """
+    path = Path(path).resolve()
+    seen = set() if _seen is None else _seen
+    if path in seen:
+        raise ValueError(
+            f"Cycle in the foundation reference chain at {path}"
+        )
+    seen.add(path)
+
+    payload = torch.load(path, map_location="cpu", weights_only=None)
+    if (
+        isinstance(payload, dict)
+        and "state_dict" not in payload
+        and "model_state_dict" in payload
+    ):
+        reference_path = _resolve_foundation_reference(
+            payload, which=which, version=version, download=download
+        )
+        reference = _load_foundation_payload(
+            reference_path,
+            which=which,
+            version=version,
+            download=download,
+            _seen=seen,
+        )
+        payload = _reconstitute_foundation_checkpoint(
+            payload,
+            reference,
+            source_path=path,
+            reference_path=reference_path,
+        )
+    return payload
+
+
 def _resolve_foundation_reference(
     trainer_checkpoint: dict,
     *,
@@ -183,8 +232,11 @@ def load_model(
         reference_path = _resolve_foundation_reference(
             checkpoint, which=which, version=version, download=download
         )
-        reference = torch.load(
-            reference_path, map_location="cpu", weights_only=None
+        reference = _load_foundation_payload(
+            reference_path,
+            which=which,
+            version=version,
+            download=download,
         )
         checkpoint = _reconstitute_foundation_checkpoint(
             checkpoint,
