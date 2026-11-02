@@ -95,7 +95,8 @@ notebooks/outputs/
 .mypy_cache/
 
 # Training checkpoints, logs, and local venvs
-checkpoints/
+# Ignore any checkpoint directory (checkpoints/, checkpoints_v2/, ...).
+checkpoints*/
 logs/
 *.ckp
 .venv/
