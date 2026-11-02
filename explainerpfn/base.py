@@ -577,7 +577,13 @@ class ExplainerPFN:  # (TabPFNRegressor):
         # no layout information and keep the constructor default.
         if "strict_item_layout" in checkpoint:
             self.strict_item_layout = bool(checkpoint["strict_item_layout"])
-        elif "model_state_dict" in checkpoint:
+        elif (
+            "head_state_dict" in checkpoint
+            or "model_state_dict" in checkpoint
+        ):
+            # Head-bearing checkpoints written before the field existed (v1-v4)
+            # used the legacy preprocessing. A stock foundation checkpoint has
+            # no head and carries no layout information; keep the default.
             self.strict_item_layout = False
         if "head_state_dict" not in checkpoint:
             return False
