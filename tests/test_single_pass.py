@@ -535,6 +535,37 @@ def test_legacy_checkpoint_uses_legacy_layout(tmp_path):
     assert xai.strict_item_layout is False
 
 
+def test_foundation_checkpoint_with_legacy_head_uses_legacy_layout(tmp_path):
+    """v1-v4 ``final_model.ckp`` files carry a head but no layout field."""
+    head = _scalar_head()
+    path = tmp_path / "v4_final.ckp"
+    torch.save(
+        {
+            "state_dict": {},
+            "config": {},
+            "head_state_dict": head.state_dict(),
+            "head_config": head.config(),
+        },
+        path,
+    )
+
+    xai = ExplainerPFN()
+    xai.config_ = _FakeConfig(8)
+    xai.bardist_ = FullSupportBarDistribution(torch.linspace(-3.0, 3.0, 513))
+    xai.device_ = torch.device("cpu")
+    assert xai.strict_item_layout is True
+    assert xai.load_attribution_head(path) is True
+    assert xai.strict_item_layout is False
+
+    # A stock foundation checkpoint (no head) keeps the constructor default.
+    stock = tmp_path / "stock.ckpt"
+    torch.save({"state_dict": {}, "config": {}}, stock)
+    xai2 = ExplainerPFN()
+    xai2.device_ = torch.device("cpu")
+    assert xai2.load_attribution_head(stock) is False
+    assert xai2.strict_item_layout is True
+
+
 def test_fresh_head_ignores_embedded_checkpoint_head(tmp_path, monkeypatch):
     path = tmp_path / "v4.ckp"
     torch.save({"model_state_dict": {}, "head_state_dict": {}, "head_config": {}}, path)
