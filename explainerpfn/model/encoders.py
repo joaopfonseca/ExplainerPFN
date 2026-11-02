@@ -118,6 +118,11 @@ def torch_nanstd(x: torch.Tensor, axis: int = 0) -> torch.Tensor:
     var = torch_nansum(torch.square(mean_broadcast - x), axis=axis) / (num - 1).clip(
         min=1.0
     )
+    # ``sqrt`` has an infinite derivative at 0. For a constant feature the
+    # downstream gradient is 0, so 0 * inf becomes NaN and poisons every
+    # parameter. Callers already substitute 1 for a zero std (see
+    # ``normalize_data``), so compute the forward value 1 there directly.
+    var = torch.where(var > 0, var, torch.ones_like(var))
     return torch.sqrt(var)
 
 

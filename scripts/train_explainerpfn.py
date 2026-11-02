@@ -847,8 +847,8 @@ def train(args, logger):
 
             if step_ok and not grads_finite:
                 logger(
-                    f"Epoch {epoch}: non-finite gradients; skipping optimizer "
-                    "step."
+                    f"Epoch {epoch}: non-finite gradients (dataset "
+                    f"{last_dataset_index}); skipping optimizer step."
                 )
                 step_ok = False
                 optimizer.zero_grad(set_to_none=True)
