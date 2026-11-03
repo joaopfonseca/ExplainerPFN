@@ -150,6 +150,11 @@ ExplainerPFN/
 │   ├── train/             # Training utilities and data generation
 │   └── visualization/     # Plotting and visualization tools
 ├── notebooks/             # Example notebooks and experiments
+│   └── paper_results/     # Generated tables/figures/pickles (git-ignored)
+├── scripts/               # Training, evaluation and paper-artifact scripts
+│   ├── train/             # Train the foundation model and validate its data
+│   ├── eval/              # Benchmark checkpoints and baselines
+│   └── results/           # Build the paper's tables and figures
 ├── requirements.txt       # Package dependencies
 ├── Makefile              # Utility commands
 └── README.md             # This file

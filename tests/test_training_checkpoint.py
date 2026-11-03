@@ -1,6 +1,6 @@
 """Tests for the training checkpoint helpers and CLI resume semantics.
 
-These cover the parts of ``scripts/train_explainerpfn.py`` and
+These cover the parts of ``scripts/train/train_explainerpfn.py`` and
 ``explainerpfn.utils`` that make cluster runs resumable: atomic saves,
 latest-checkpoint discovery, and a full save→load roundtrip that restores the
 model, optimizer, epoch, and online-data index.
@@ -21,8 +21,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_train_module():
-    """Import scripts/train_explainerpfn.py as a module."""
-    path = _REPO_ROOT / "scripts" / "train_explainerpfn.py"
+    """Import scripts/train/train_explainerpfn.py as a module."""
+    path = _REPO_ROOT / "scripts" / "train" / "train_explainerpfn.py"
     spec = importlib.util.spec_from_file_location("train_explainerpfn", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["train_explainerpfn"] = module

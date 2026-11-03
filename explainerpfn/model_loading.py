@@ -39,7 +39,7 @@ def _reconstitute_foundation_checkpoint(
 ) -> dict:
     """Build a foundation-format payload from a trainer checkpoint.
 
-    Trainer checkpoints (``scripts/train_explainerpfn.py``) store the
+    Trainer checkpoints (``scripts/train/train_explainerpfn.py``) store the
     fine-tuned weights under ``model_state_dict`` but neither the
     bar-distribution (``criterion.*``) state nor the architecture config.
     Both are training-invariant -- the trainer's optimizer only ever held
@@ -77,7 +77,7 @@ def _reconstitute_foundation_checkpoint(
         f"{trainer_checkpoint.get('epoch', '?')}): using its model weights, "
         f"with criterion and architecture config from {reference_path}. "
         "Optimizer, scheduler and RNG state are ignored (to resume training, "
-        "use scripts/train_explainerpfn.py --resume)."
+        "use scripts/train/train_explainerpfn.py --resume)."
     )
     return {
         "state_dict": {**reference_state, **model_state},
@@ -199,7 +199,7 @@ def load_model(
     Both checkpoint formats written by this project are accepted: foundation
     checkpoints (``{"state_dict", "config"}`` -- the stock TabPFN models or
     ``*.ckp`` files written by ``save_foundation_model``) and trainer
-    checkpoints from ``scripts/train_explainerpfn.py`` (recognized by their
+    checkpoints from ``scripts/train/train_explainerpfn.py`` (recognized by their
     ``model_state_dict`` key). For trainer checkpoints only the model weights
     are used; the bar distribution and architecture config are taken from the
     foundation checkpoint the run was fine-tuned from.
@@ -258,7 +258,7 @@ def load_model(
         raise ValueError(
             f"Checkpoint {path} matches neither supported format: expected a "
             "foundation checkpoint with keys 'state_dict' and 'config', or a "
-            "trainer checkpoint from scripts/train_explainerpfn.py with key "
+            "trainer checkpoint from scripts/train/train_explainerpfn.py with key "
             f"'model_state_dict'. Found: {found}."
         )
 

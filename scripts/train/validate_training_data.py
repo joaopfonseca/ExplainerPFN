@@ -6,8 +6,8 @@ efficiency residual. Optionally contrasts against a legacy pickle produced by
 the old surrogate-SHAP pipeline (plain ``pickle`` — no legacy code required).
 
 Usage:
-    python scripts/validate_training_data.py --n-datasets 20
-    python scripts/validate_training_data.py --n-datasets 20 \\
+    python scripts/train/validate_training_data.py --n-datasets 20
+    python scripts/train/validate_training_data.py --n-datasets 20 \\
         --legacy-pkl ../synthetic_data_sample.pkl
 """
 
@@ -15,10 +15,11 @@ import argparse
 import pickle
 import sys
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 
-sys.path.append(".")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from explainerpfn.train.synthetic_data import SyntheticDataGenerator  # noqa: E402
 

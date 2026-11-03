@@ -25,13 +25,13 @@ On top of the notebook it adds:
 Usage::
 
     # Fresh run on one GPU
-    python scripts/train_explainerpfn.py --device cuda --num-epochs 100000
+    python scripts/train/train_explainerpfn.py --device cuda --num-epochs 100000
 
     # Resume from a specific checkpoint
-    python scripts/train_explainerpfn.py --resume checkpoints/checkpoint_5000.pt
+    python scripts/train/train_explainerpfn.py --resume checkpoints/checkpoint_5000.pt
 
     # Resume from the latest checkpoint in --save-dir (or start fresh)
-    python scripts/train_explainerpfn.py --auto-resume
+    python scripts/train/train_explainerpfn.py --auto-resume
 
 The launched shell wrapper ``scripts/start_explainerpfn.sh`` sets up the
 interpreter and sane cluster defaults; it is the recommended entry point.
@@ -52,7 +52,7 @@ import numpy as np
 import torch
 from torch import optim
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from explainerpfn.base import ExplainerPFN  # noqa: E402
 from explainerpfn.model.attribution_head import (  # noqa: E402
