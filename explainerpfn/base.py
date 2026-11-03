@@ -112,7 +112,7 @@ def initialize_explainerpfn_model(
     Args:
         model_path: Path or directive ("auto") to load the pre-trained model
             from. Trainer checkpoints written by
-            ``scripts/train_explainerpfn.py`` (``checkpoint_*.pt``) are also
+            ``scripts/train/train_explainerpfn.py`` (``checkpoint_*.pt``) are also
             accepted: only the model weights are used, with the bar
             distribution and architecture config taken from the foundation
             model the run was fine-tuned from. If the checkpoint carries a

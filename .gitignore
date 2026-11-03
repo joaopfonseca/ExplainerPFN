@@ -79,9 +79,11 @@ target/
 
 # exclude data from source control by default
 */data/
+data/
 
 # exclude analysis results
 notebooks/outputs/
+notebooks/paper_results/
 
 # Mac OS-specific storage files
 .DS_Store
@@ -99,6 +101,7 @@ notebooks/outputs/
 checkpoints*/
 logs/
 *.ckp
+*.ckpt
 .venv/
 venv/
 

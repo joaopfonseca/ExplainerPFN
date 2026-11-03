@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch ExplainerPFN training on a cluster (or locally).
 #
-# Thin wrapper around scripts/train_explainerpfn.py that:
+# Thin wrapper around scripts/train/train_explainerpfn.py that:
 #   1. resolves the repo root and a Python interpreter with torch installed;
 #   2. pins sane, cluster-friendly defaults (checkpoints/logs under the repo);
 #   3. reduces CUDA allocator fragmentation across variable-size datasets;
@@ -24,8 +24,11 @@
 
 set -e
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
 TRAIN_ARGS=(
-  --model-path "$HOME/ExplainerPFN/notebooks/tabpfn-v2-regressor.ckpt"
+  --model-path "$REPO_ROOT/notebooks/tabpfn-v2-regressor.ckpt"
   --device "auto"
   --save-dir "checkpoints"
   --log-dir "logs"
@@ -44,6 +47,6 @@ TRAIN_ARGS=(
 # Reduce allocator fragmentation across variable-size datasets.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-python scripts/train_explainerpfn.py \
+python scripts/train/train_explainerpfn.py \
     "${TRAIN_ARGS[@]}" \
     "$@"

@@ -25,7 +25,7 @@ def _reference_payload():
 
 
 def _trainer_payload(epoch=83000, model_path="/nonexistent/stock.ckp"):
-    """Trainer-format checkpoint as written by scripts/train_explainerpfn.py."""
+    """Trainer-format checkpoint as written by scripts/train/train_explainerpfn.py."""
     return {
         "model_state_dict": {
             "encoder.weight": torch.zeros(3, 4),

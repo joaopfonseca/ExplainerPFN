@@ -9,11 +9,11 @@ using exactly the metrics from notebooks/8-analysis-across-datasets.ipynb:
 - ``apply_correction(y_test_scores, exp, kind=["statistical", "additive"])``,
 - Pearson correlation and top-k Jaccard similarity vs the stored SHAP values.
 
-Usage:
-    python scripts/eval_checkpoint_benchmark.py \
-        --results-pkl notebooks/results_across_datasets_mlp.pkl \
-        --models stock=notebooks/tabpfn-v2-regressor.ckpt \
-                 nov15=eval_models/explainerpfn_model_NOV_15.ckp \
+Usage::
+
+    python scripts/eval/benchmark_checkpoints.py \
+        --results-pkl notebooks/paper_results/pickles/results_across_datasets_mlp.pkl \
+        --models v5=checkpoints/v5/final_model.ckp \
         --output logs/checkpoint_benchmark.csv
 """
 
@@ -28,6 +28,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from _common import (  # noqa: E402
+    LOGS_DIR,
+    add_repo_to_path,
+    DEFAULT_RESULTS,
+    safe_corr,
+    top_k_jaccard_similarity,
+)
+
+add_repo_to_path()
+
 from explainerpfn.base import ExplainerPFN  # noqa: E402
 
 _INFERENCE_PRECISION = {
@@ -38,36 +48,11 @@ _INFERENCE_PRECISION = {
 }
 
 
-def _safe_corr(a, b):
-    a, b = np.asarray(a, float).ravel(), np.asarray(b, float).ravel()
-    if a.std() == 0 or b.std() == 0:
-        return float("nan")
-    return float(np.corrcoef(a, b)[0, 1])
-
-
-def top_k_jaccard_similarity(arr1, arr2, k=3):
-    """Mean top-k Jaccard similarity between the absolute values of two arrays."""
-    if arr1.ndim == 1:
-        arr1 = arr1.reshape(1, -1)
-    if arr2.ndim == 1:
-        arr2 = arr2.reshape(1, -1)
-    feats1 = np.argpartition(arr1, -k, axis=1)[:, -k:]
-    feats2 = np.argpartition(arr2, -k, axis=1)[:, -k:]
-    intersection = [
-        np.intersect1d(r1, r2).shape[0] for r1, r2 in zip(feats1, feats2)
-    ]
-    union = [
-        r1.shape[0] + r2.shape[0] - inter
-        for r1, r2, inter in zip(feats1, feats2, intersection)
-    ]
-    return np.array(intersection) / np.array(union)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--results-pkl",
-        default="notebooks/results_across_datasets_mlp.pkl",
+        default=str(DEFAULT_RESULTS["mlp"]),
         help="Pickle mapping dataset name -> experiment results.",
     )
     parser.add_argument(
@@ -77,7 +62,7 @@ def main():
         metavar="NAME=PATH",
         help="Checkpoint(s) to evaluate as NAME=PATH.",
     )
-    parser.add_argument("--output", default="logs/checkpoint_benchmark.csv")
+    parser.add_argument("--output", default=str(LOGS_DIR / "checkpoint_benchmark.csv"))
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--inference-precision",
@@ -89,10 +74,10 @@ def main():
     parser.add_argument("--jaccard-perc", type=float, default=1.0 / 3.0)
     parser.add_argument(
         "--mode",
-        choices=["per-feature", "joint"],
-        default="per-feature",
-        help="Decoding path. 'joint' loads each checkpoint's AttributionHead "
-        "and uses predict(mode='joint').",
+        choices=["auto", "per-feature", "joint"],
+        default="auto",
+        help="Decoding path. 'auto' uses the checkpoint's AttributionHead "
+        "(joint) when present and per-feature otherwise.",
     )
     parser.add_argument(
         "--datasets",
@@ -176,10 +161,13 @@ def main():
                     # A joint head embedded in the checkpoint is auto-loaded
                     # by ``fit``; ``--mode joint`` on a headless checkpoint
                     # raises a clear error from ``predict``.
+                    mode = (
+                        args.mode
+                        if args.mode != "auto"
+                        else ("joint" if xai.head_ is not None else "per-feature")
+                    )
                     preds.append(
-                        xai.predict(X_test[:, perm], y_test, mode=args.mode)[
-                            :, inv
-                        ]
+                        xai.predict(X_test[:, perm], y_test, mode=mode)[:, inv]
                     )
                 exp = preds[0] if len(preds) == 1 else np.mean(preds, axis=0)
                 if args.corrections == ["none"]:
@@ -188,7 +176,7 @@ def main():
                     corrected = xai.apply_correction(
                         y_test, exp, kind=args.corrections
                     )
-                corr = _safe_corr(corrected, shap_ref)
+                corr = safe_corr(corrected, shap_ref)
                 jac = float(
                     np.mean(
                         top_k_jaccard_similarity(

@@ -4,8 +4,9 @@ Runs the end-to-end pipeline on a synthetic dataset for which the true Shapley
 values are known analytically, and reports how well the produced explanations
 recover them. This is meant to be run before and after retraining the model.
 
-Usage:
-    python scripts/eval_synthetic_shap.py [--model-path PATH] [--n-samples N]
+Usage::
+
+    python scripts/eval/check_synthetic_shap.py [--model-path PATH] [--n-samples N]
 """
 
 import argparse
@@ -16,27 +17,26 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from _common import add_repo_to_path, resolve_model_path, safe_corr  # noqa: E402
+
+add_repo_to_path()
+
 from explainerpfn.base import ExplainerPFN  # noqa: E402
-
-
-def _safe_corr(a, b):
-    a, b = np.asarray(a, float), np.asarray(b, float)
-    if a.std() == 0 or b.std() == 0:
-        return float("nan")
-    return float(np.corrcoef(a, b)[0, 1])
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model-path",
-        default="notebooks/tabpfn-v2-regressor.ckpt",
+        default=None,
+        help="ExplainerPFN checkpoint (default: resolve_model_path()).",
     )
     parser.add_argument("--n-train", type=int, default=90)
     parser.add_argument("--n-test", type=int, default=30)
     parser.add_argument("--n-features", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    model_path = resolve_model_path(args.model_path)
 
     rng = np.random.default_rng(args.seed)
     p = args.n_features
@@ -53,7 +53,7 @@ def main():
     # Gaussian features: phi_j = beta_j * (x_j - E[x_j]).
     true_phi = (X_test - X_train.mean(axis=0)) * beta
 
-    explainer = ExplainerPFN(model_path=args.model_path, device="cpu")
+    explainer = ExplainerPFN(model_path=model_path, device="cpu")
     explainer.fit(X_train, y_train)
     exp = explainer.predict(X_test, y_test)
 
@@ -62,8 +62,8 @@ def main():
     for j in range(p):
         print(
             f"  feat {j} (beta={beta[j]:.2f}): "
-            f"corr(exp, phi)={_safe_corr(exp[:, j], true_phi[:, j]): .3f}  "
-            f"corr(exp, x_j)={_safe_corr(exp[:, j], X_test[:, j]): .3f}  "
+            f"corr(exp, phi)={safe_corr(exp[:, j], true_phi[:, j]): .3f}  "
+            f"corr(exp, x_j)={safe_corr(exp[:, j], X_test[:, j]): .3f}  "
             f"exp_std={exp[:, j].std():.3f}  "
             f"|exp|mean={np.abs(exp[:, j]).mean():.3f}"
         )
@@ -85,7 +85,7 @@ def main():
     print(
         "  "
         + ", ".join(
-            f"feat{j}={_safe_corr(corrected[:, j], true_phi[:, j]):.3f}" for j in range(p)
+            f"feat{j}={safe_corr(corrected[:, j], true_phi[:, j]):.3f}" for j in range(p)
         )
     )
 
