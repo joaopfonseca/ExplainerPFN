@@ -25,6 +25,10 @@ scripts/
 ├── train/
 │   ├── train_explainerpfn.py
 │   └── validate_training_data.py
+├── datasets/
+│   ├── build_registry.py
+│   ├── report.py
+│   └── legacy_gate.py
 ├── eval/
 │   ├── benchmark_checkpoints.py
 │   ├── benchmark_surrogates.py
@@ -52,6 +56,17 @@ scripts/
 
 Set `$EPFN_MODEL_PATH` when the checkpoint is not under the default
 `checkpoints*/final_model.ckp` location (e.g. `checkpoints_v5/` on the cluster).
+
+## Datasets (`datasets/`)
+
+The expanded benchmark pool is frozen in `explainerpfn/datasets/registry.py` and
+loaded with `explainerpfn.datasets.ExpandedDatasets`. These scripts build and check it.
+
+| Script | Purpose |
+| --- | --- |
+| `build_registry.py` | Rebuilds `explainerpfn/datasets/registry.py`, the processed-data cache (`data/expanded/`, git-ignored) and the reports. Reproduces the committed registry byte for byte. |
+| `report.py` | Called by `build_registry.py`; writes `datasets_summary.tex` (paper table) and `mapping_report.md` (bucket counts, imputed datasets, every skipped candidate with its reason). |
+| `legacy_gate.py` | Checks that the legacy datasets reproduce the arrays stored in the `results_across_datasets_*.pkl` files. |
 
 ## Training (`train/`)
 
