@@ -178,6 +178,22 @@ def test_train_test_split_follows_benchmark_protocol(tmp_path):
     assert set(y_tr) | set(y_te) == {0, 1}
 
 
+def test_test_size_rule_caps_at_2000():
+    assert ExpandedDatasets.test_size(200) == 0.3
+    assert ExpandedDatasets.test_size(6666) == 0.3   # ceil(0.3 n) = 2000 -> still 30%
+    assert ExpandedDatasets.test_size(6667) == 2000  # 30% would be 2001 rows
+    assert ExpandedDatasets.test_size(20000) == 2000
+
+
+def test_train_test_split_caps_large_datasets(tmp_path):
+    big = _frame(0, n=8000, d=4)
+    path = _fake_registry(tmp_path, {"big": (big, "[3,7)", "uci")})
+    ds = ExpandedDatasets(data_home=tmp_path, entries=path,
+                          download_if_missing=False).download()
+    X_tr, X_te, y_tr, y_te = ds.train_test_split("big")
+    assert X_te.shape == (2000, 4) and X_tr.shape == (6000, 4)
+
+
 def test_default_data_home_respects_environment(monkeypatch, tmp_path):
     monkeypatch.setenv(reg.DATA_HOME_ENV, str(tmp_path))
     assert reg.default_data_home() == tmp_path

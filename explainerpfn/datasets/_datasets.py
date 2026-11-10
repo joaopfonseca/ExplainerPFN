@@ -188,15 +188,30 @@ class ExpandedDatasets(Datasets):
         return self
 
     # ------------------------------------------------------------------ protocol
-    def train_test_split(self, name: str, test_size: float = 0.3, random_state: int = 42):
+    MAX_TEST = 2000  # cap on the test-set size (bounds the cost of exact SHAP)
+
+    @classmethod
+    def test_size(cls, n: int):
+        """Benchmark test-set size for ``n`` rows: ``min(30%, MAX_TEST rows)``.
+
+        Returns the float 0.3 while the 30% test set fits under the cap (identical to the
+        plain 70/30 split used for the original datasets) and the integer ``MAX_TEST``
+        otherwise.
+        """
+        return 0.3 if int(np.ceil(0.3 * n)) <= cls.MAX_TEST else cls.MAX_TEST
+
+    def train_test_split(self, name: str, test_size=None, random_state: int = 42):
         """Benchmark split of one dataset: ``X_train, X_test, y_train, y_test``.
 
-        Same protocol as ``scripts/results/base_model_families.py``: 70/30 split with
+        Same protocol as ``scripts/results/base_model_families.py``, with the test set
+        capped at ``MAX_TEST`` rows (``test_size=None``; see :meth:`test_size`):
         ``random_state=42``, labels remapped to {0, 1} (smaller label -> 0).
         """
         df = self[name.upper().replace("_", " ")]
         X = df.drop(columns="target").values
         y = df["target"].values
+        if test_size is None:
+            test_size = self.test_size(len(df))
         X_tr, X_te, y_tr, y_te = train_test_split(
             X, y, test_size=test_size, random_state=random_state)
         y_tr = np.where(y_tr == y_tr.min(), 0, 1).astype(int)

@@ -43,6 +43,7 @@ scripts/
     ├── acs_case_study.py
     ├── dag_reconstruction.py
     ├── base_model_families.py
+    ├── compute_ground_truth.py
     ├── black_box_case_study.py
     └── efficiency_residuals.py
 ```
@@ -105,6 +106,7 @@ These produce the tables and figures of the paper under
 | `synthetic_to_real_gap.py` | - | `figures/synthetic_to_real_gap_histograms.pdf`, `tables/synthetic_to_real_gap_summary.tex` |
 | `acs_case_study.py` | `notebooks/9-case-study.ipynb` | ACS waterfall and agreement figures |
 | `dag_reconstruction.py` | notebook 8 (DAG cells) | DAG ground-truth/predicted and graph-edit-distance figures |
+| `compute_ground_truth.py` | expanded benchmark, stage A | per (dataset, family) base model + SHAP ground-truth pickles in `pickles/ground_truth/<family>/` (sharded, resumable) |
 | `base_model_families.py` | `notebooks/11-*.ipynb` (removed) | results pickles/tables/figures for the additional base-model families |
 | `black_box_case_study.py` | - | third-party black-box case study figure set |
 | `efficiency_residuals.py` | - | Shapley efficiency residuals on the cached synthetic ablations |
