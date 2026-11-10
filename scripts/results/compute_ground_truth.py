@@ -196,12 +196,15 @@ def main(argv=None) -> int:
     ap.add_argument("--max-evals", type=int, default=1000, help="permutation SHAP budget")
     ap.add_argument("--out-dir", default=str(GROUND_TRUTH_DIR))
     ap.add_argument("--data-home", default=None)
+    ap.add_argument("--offline", action="store_true",
+                    help="never rebuild missing datasets from their source (cluster nodes)")
     ap.add_argument("--log", default=str(RUN_LOG))
     args = ap.parse_args(argv)
 
     table = json.loads(Path(args.method_table).read_text()) if args.method_table else None
     datasets = ExpandedDatasets(names=args.datasets, buckets=args.buckets,
-                                data_home=args.data_home).download()
+                                data_home=args.data_home,
+                                download_if_missing=not args.offline).download()
     rows = select_rows(datasets, parse_shard(args.shard))
     pairs = [(row, family) for row in rows for family in args.families]
     print(f"{len(rows)} datasets x {len(args.families)} families = {len(pairs)} pairs")
