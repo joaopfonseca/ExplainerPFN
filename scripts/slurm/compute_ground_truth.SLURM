@@ -11,6 +11,8 @@
 #   sbatch scripts/slurm/compute_ground_truth.SLURM
 # Results: notebooks/paper_results/pickles/ground_truth/<family>/<dataset>.pkl,
 #   logs/benchmarks/ground_truth_runs.csv and logs/ground_truth/ (per-process logs).
+# Monitor: python scripts/results/ground_truth_status.py [--pending]; squeue -u $USER;
+#   tail -c 300 logs/ground_truth/shard<i>_<family>.log (SHAP progress of one process).
 #SBATCH --job-name=epfn_gt
 #SBATCH --output=/mnt/storage/admindi/home/jfonseca/slurm_outputs/%x-%A_%a.out
 #SBATCH --error=/mnt/storage/admindi/home/jfonseca/slurm_outputs/%x-%A_%a.err
@@ -28,6 +30,8 @@ source .venv/bin/activate
 
 # Single-threaded BLAS/OpenMP in every process: numerics identical to a local run.
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+# tqdm bars go to log files: refresh at most once a minute to keep them readable.
+export TQDM_MININTERVAL=60
 
 FAMILIES="random_forest xgboost mlp logreg knn"
 N_SHARDS=46

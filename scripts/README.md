@@ -46,6 +46,7 @@ scripts/
     ├── dag_reconstruction.py
     ├── base_model_families.py
     ├── compute_ground_truth.py
+    ├── ground_truth_status.py
     ├── black_box_case_study.py
     └── efficiency_residuals.py
 ```
@@ -110,6 +111,7 @@ These produce the tables and figures of the paper under
 | `dag_reconstruction.py` | notebook 8 (DAG cells) | DAG ground-truth/predicted and graph-edit-distance figures |
 | `compute_ground_truth.py` | expanded benchmark, stage A | per (dataset, family) base model + SHAP ground-truth pickles in `pickles/ground_truth/<family>/` (sharded, resumable) |
 | `slurm/compute_ground_truth.SLURM` | expanded benchmark, stage A | SLURM array (one task per dataset, CPU) running `compute_ground_truth.py` on corsa; setup steps in its header |
+| `ground_truth_status.py` | expanded benchmark, stage A | progress of the ground-truth run: finished pairs per family, errors, slowest pairs |
 | `base_model_families.py` | `notebooks/11-*.ipynb` (removed) | results pickles/tables/figures for the additional base-model families |
 | `black_box_case_study.py` | - | third-party black-box case study figure set |
 | `efficiency_residuals.py` | - | Shapley efficiency residuals on the cached synthetic ablations |
