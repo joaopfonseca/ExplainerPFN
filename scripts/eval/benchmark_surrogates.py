@@ -23,8 +23,8 @@ Usage::
 
 import argparse
 import csv
-import pickle
 import sys
+import time
 from itertools import product
 from pathlib import Path
 
@@ -44,8 +44,12 @@ from _common import (  # noqa: E402
     DEFAULT_RESULTS,
     LOGS_DIR,
     TABPFN_MODEL,
+    load_results,
     safe_corr,
+    safe_spearman,
+    shard_items,
     top_k_jaccard_similarity,
+    write_pickle_atomic,
 )
 
 
@@ -99,16 +103,38 @@ def main():
     parser.add_argument("--jaccard-perc", type=float, default=1.0 / 3.0)
     parser.add_argument("--protocols", nargs="+", default=["aligned", "original"])
     parser.add_argument("--datasets", nargs="*", default=None)
+    parser.add_argument("--shard", default=None, help="i/N: every N-th dataset (SLURM arrays)")
+    parser.add_argument(
+        "--save-predictions",
+        default=None,
+        metavar="DIR",
+        help="Store the explanations of every dataset as DIR/<dataset>.pkl, with the keys "
+        "of the results pickles (<predictor>_n<n> and <predictor>_n<n>_time for the "
+        "'original' protocol, prefixed 'aligned_' for the 'aligned' one).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="With --save-predictions: skip datasets already stored.",
+    )
     args = parser.parse_args()
 
-    with open(args.results_pkl, "rb") as f:
-        results = pickle.load(f)
+    # A results pickle, or a ground-truth artifact directory (one pickle per dataset).
+    results = load_results(args.results_pkl)
 
     predictors = _make_predictors(args.device, args.tabpfn_model)
-    names = args.datasets if args.datasets else sorted(results.keys())
+    names = shard_items(args.datasets if args.datasets else sorted(results.keys()), args.shard)
 
     rows = []
     for ds in names:
+        pred_path = None
+        if args.save_predictions:
+            slug = "".join(c for c in ds.lower() if c.isalnum())
+            pred_path = Path(args.save_predictions) / f"{slug}.pkl"
+            if args.resume and pred_path.exists():
+                print(f"skip {ds} (predictions exist)", flush=True)
+                continue
+        record = {"dataset": ds}
         r = results[ds]
         X_train, X_test = r["X_train"], r["X_test"]
         y_train, y_test = r["y_train"], r["y_test"]
@@ -139,14 +165,20 @@ def main():
             X_s, _, lab_s, _ = train_test_split(
                 pool_X, pool_lab, train_size=n, random_state=args.random_state
             )
+            t0 = time.time()
             shap_s = explainer(scaler.transform(X_s)).values[:, :, -1]
+            shap_time = time.time() - t0
             Xy_sample = np.concatenate([X_s, lab_s.reshape(-1, 1)], axis=1)
             Xy_test = np.concatenate([X_test, test_lab.reshape(-1, 1)], axis=1)
 
             for pname, factory in predictors.items():
+                t0 = time.time()
                 preds = _few_shot(
                     Xy_sample, shap_s, Xy_test, factory(), X_test.shape[1]
                 )
+                elapsed = shap_time + (time.time() - t0)  # sample SHAP + fit + predict
+                key = f"{pname}_n{n}" if protocol == "original" else f"aligned_{pname}_n{n}"
+                record[key], record[f"{key}_time"] = preds, elapsed
                 corr = safe_corr(preds, shap_ref)
                 jac = float(
                     np.mean(
@@ -161,6 +193,8 @@ def main():
                         "n": n,
                         "corr": corr,
                         "jaccard": jac,
+                        "spearman": safe_spearman(preds, shap_ref),
+                        "time": elapsed,
                     }
                 )
                 print(
@@ -169,11 +203,16 @@ def main():
                     flush=True,
                 )
 
+        if pred_path is not None:
+            write_pickle_atomic(pred_path, record)
+
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="") as f:
         w = csv.DictWriter(
-            f, fieldnames=["dataset", "protocol", "predictor", "n", "corr", "jaccard"]
+            f,
+            fieldnames=["dataset", "protocol", "predictor", "n", "corr", "jaccard",
+                        "spearman", "time"],
         )
         w.writeheader()
         w.writerows(rows)

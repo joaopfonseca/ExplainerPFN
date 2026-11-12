@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -129,11 +130,83 @@ def top_k_jaccard_similarity(arr1, arr2, k: int = 3) -> np.ndarray:
     return np.array(intersection) / np.array(union)
 
 
+class ArtifactDir(Mapping):
+    """Lazy ``{display name: artifact}`` view of a ground-truth directory.
+
+    ``scripts/results/compute_ground_truth.py`` writes one pickle per dataset under
+    ``pickles/ground_truth/<family>/``. Pickles are only loaded on access (a random-forest
+    artifact can be large), and only datasets of the frozen registry that have an artifact
+    appear as keys, so partially finished runs can already be evaluated.
+    """
+
+    def __init__(self, path: str | os.PathLike):
+        add_repo_to_path()
+        from explainerpfn.datasets import REGISTRY, ExpandedDatasets
+        from explainerpfn.datasets.processing import normalize_name
+
+        self.path = Path(path)
+        self._files = {}
+        for row in REGISTRY:
+            file = self.path / f"{normalize_name(row['dataset'])}.pkl"
+            if file.exists():
+                self._files[ExpandedDatasets.display_name(row["dataset"])] = file
+
+    def __getitem__(self, key):
+        import pickle
+
+        with open(self._files[key], "rb") as handle:
+            return pickle.load(handle)
+
+    def __iter__(self):
+        return iter(self._files)
+
+    def __len__(self):
+        return len(self._files)
+
+
+def shard_items(items, shard: str | None):
+    """Items of shard ``"i/N"`` (every N-th item); all items when ``shard`` is None."""
+    items = list(items)
+    if shard is None:
+        return items
+    index, count = (int(x) for x in shard.split("/"))
+    if not 0 <= index < count:
+        raise ValueError(f"shard {shard!r} must satisfy 0 <= i < N")
+    return items[index::count]
+
+
+def safe_spearman(a, b) -> float:
+    """Pooled Spearman correlation, ``nan`` when either input is constant."""
+    from scipy.stats import spearmanr
+
+    a, b = np.asarray(a, float).ravel(), np.asarray(b, float).ravel()
+    if a.std() == 0 or b.std() == 0:
+        return float("nan")
+    return float(spearmanr(a, b)[0])
+
+
+def write_pickle_atomic(path: str | os.PathLike, obj) -> None:
+    """Pickle ``obj`` so that an interrupted job never leaves a truncated file."""
+    import pickle
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as handle:
+        pickle.dump(obj, handle)
+    tmp.replace(path)
+
+
 def load_results(name_or_path: str | os.PathLike = "mlp"):
-    """Load an experiment results pickle (``mlp``, ``random_forest`` or a path)."""
+    """Load experiment results: ``mlp``, ``random_forest``, a pickle, or an artifact directory.
+
+    A directory (``pickles/ground_truth/<family>``) returns a lazy :class:`ArtifactDir`.
+    """
     import pickle
 
     path = Path(name_or_path)
+    if path.is_dir():
+        return ArtifactDir(path)
     if not path.is_file():
         try:
             path = DEFAULT_RESULTS[str(name_or_path)]

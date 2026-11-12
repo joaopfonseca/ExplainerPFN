@@ -90,8 +90,8 @@ and never modify the paper artifacts.
 
 | Script | Purpose |
 | --- | --- |
-| `benchmark_checkpoints.py` | Scores one or more checkpoints against the SHAP references stored in a results pickle, using the paper protocol (fit on train+test, `statistical+additive` corrections, Pearson + top-k Jaccard). `--mode joint` uses the checkpoint's attribution head; `--mode per-feature` the legacy per-feature path. |
-| `benchmark_surrogates.py` | Trains the few-shot surrogate baselines (TabPFN / MLP / RF) on 2-10 reference explanations and scores them with the same metrics. `--protocols aligned original` contrasts the scores-conditioned and label-conditioned variants. |
+| `benchmark_checkpoints.py` | Scores one or more checkpoints against the SHAP references stored in a results pickle, using the paper protocol (fit on train+test, `statistical+additive` corrections, Pearson + top-k Jaccard). `--mode joint` uses the checkpoint's attribution head; `--mode per-feature` the legacy per-feature path. `--results-pkl` also accepts a ground-truth artifact directory (`pickles/ground_truth/<family>`); `--shard i/N`, `--save-predictions DIR` (explanations under the results-pickle keys) and `--resume` support SLURM arrays. The CSV also has Spearman and fit+predict time. |
+| `benchmark_surrogates.py` | Trains the few-shot surrogate baselines (TabPFN / MLP / RF) on 2-10 reference explanations and scores them with the same metrics. `--protocols aligned original` contrasts the scores-conditioned and label-conditioned variants. Same `--results-pkl` (file or artifact directory), `--shard`, `--save-predictions` and `--resume` options; the CSV adds Spearman and time. |
 | `check_synthetic_shap.py` | End-to-end smoke test on a synthetic linear problem with analytic Shapley values. |
 | `stress_scalability.py` | Zero-shot performance as a function of the number of features on synthetic data (appendix figure). |
 

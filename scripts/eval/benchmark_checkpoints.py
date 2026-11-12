@@ -19,8 +19,8 @@ Usage::
 
 import argparse
 import csv
-import pickle
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +32,12 @@ from _common import (  # noqa: E402
     LOGS_DIR,
     add_repo_to_path,
     DEFAULT_RESULTS,
+    load_results,
     safe_corr,
+    safe_spearman,
+    shard_items,
     top_k_jaccard_similarity,
+    write_pickle_atomic,
 )
 
 add_repo_to_path()
@@ -46,6 +50,30 @@ _INFERENCE_PRECISION = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+def _prediction_path(save_dir, label, dataset_name):
+    """``DIR/<model>/<dataset>.pkl`` (None when predictions are not saved)."""
+    if not save_dir:
+        return None
+    slug = "".join(c for c in dataset_name.lower() if c.isalnum())
+    return Path(save_dir) / label / f"{slug}.pkl"
+
+
+def _prediction_record(xai, dataset_name, label, exp, scores, elapsed):
+    """Explanations under the keys of the results pickles (see base_model_families.py)."""
+    return {
+        "dataset": dataset_name,
+        "model": label,
+        "explainerpfn": exp / np.sqrt(exp.shape[1]),
+        "explainerpfn_statistical+additive": xai.apply_correction(
+            scores, exp, kind=["statistical", "additive"]
+        ),
+        "explainerpfn_additive": xai.apply_correction(
+            scores, exp - exp.mean(axis=0), kind=["additive"]
+        ),
+        "explainerpfn_time": elapsed,
+    }
 
 
 def main():
@@ -107,6 +135,25 @@ def main():
         help="Explanation corrections applied before scoring, matching the "
         "paper protocol. Use 'none' to score raw predictions.",
     )
+    parser.add_argument(
+        "--shard",
+        default=None,
+        help="i/N: evaluate every N-th dataset (for SLURM arrays).",
+    )
+    parser.add_argument(
+        "--save-predictions",
+        default=None,
+        metavar="DIR",
+        help="Also store the explanations of every (model, dataset) as "
+        "DIR/<model>/<dataset>.pkl with the keys of the results pickles "
+        "(explainerpfn, explainerpfn_statistical+additive, explainerpfn_additive, "
+        "explainerpfn_time), so tables and bootstrap CIs can be built later.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="With --save-predictions: skip (model, dataset) pairs already stored.",
+    )
     args = parser.parse_args()
 
     models = []
@@ -116,20 +163,26 @@ def main():
             raise ValueError(f"invalid --models entry {spec!r}; expected NAME=PATH")
         models.append((name, path))
 
-    with open(args.results_pkl, "rb") as f:
-        results = pickle.load(f)
+    # A results pickle, or a ground-truth artifact directory (one pickle per dataset).
+    results = load_results(args.results_pkl)
 
     inference_precision = _INFERENCE_PRECISION.get(
         args.inference_precision, args.inference_precision
     )
 
-    dataset_names = (
-        args.datasets if args.datasets else sorted(results.keys())
+    dataset_names = shard_items(
+        args.datasets if args.datasets else sorted(results.keys()), args.shard
     )
 
     rows = []
     print(f"{'dataset':24s} {'model':14s} {'corr':>7s} {'jaccard':>8s}", flush=True)
     for dataset_name in dataset_names:
+        if args.save_predictions and args.resume and all(
+            _prediction_path(args.save_predictions, label, dataset_name).exists()
+            for label, _ in models
+        ):
+            print(f"skip {dataset_name} (predictions exist)", flush=True)
+            continue
         r = results[dataset_name]
         X_test, y_test = r["X_test"], r["y_test_scores"]
         X_fit = np.concatenate([r["X_train"], X_test], axis=0)
@@ -138,8 +191,12 @@ def main():
         k = max(1, int(X_test.shape[1] * args.jaccard_perc))
 
         for label, model_path in models:
-            corr = jac = float("nan")
+            corr = jac = spearman = elapsed = float("nan")
+            pred_path = _prediction_path(args.save_predictions, label, dataset_name)
+            if args.save_predictions and args.resume and pred_path.exists():
+                continue
             try:
+                t0 = time.time()
                 n_feat = X_test.shape[1]
                 preds = []
                 for order_idx in range(max(1, args.order_ensemble)):
@@ -170,6 +227,12 @@ def main():
                         xai.predict(X_test[:, perm], y_test, mode=mode)[:, inv]
                     )
                 exp = preds[0] if len(preds) == 1 else np.mean(preds, axis=0)
+                elapsed = time.time() - t0
+                if args.save_predictions:
+                    write_pickle_atomic(
+                        pred_path,
+                        _prediction_record(xai, dataset_name, label, exp, y_test, elapsed),
+                    )
                 if args.corrections == ["none"]:
                     corrected = exp
                 else:
@@ -177,6 +240,7 @@ def main():
                         y_test, exp, kind=args.corrections
                     )
                 corr = safe_corr(corrected, shap_ref)
+                spearman = safe_spearman(corrected, shap_ref)
                 jac = float(
                     np.mean(
                         top_k_jaccard_similarity(
@@ -199,6 +263,8 @@ def main():
                     "jaccard": jac,
                     "fit_rows": int(X_fit.shape[0]),
                     "n_features": int(X_test.shape[1]),
+                    "spearman": spearman,
+                    "fit_predict_time": elapsed,
                 }
             )
             print(
@@ -211,7 +277,8 @@ def main():
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["dataset", "model", "corr", "jaccard", "fit_rows", "n_features"],
+            fieldnames=["dataset", "model", "corr", "jaccard", "fit_rows", "n_features",
+                        "spearman", "fit_predict_time"],
         )
         writer.writeheader()
         writer.writerows(rows)
