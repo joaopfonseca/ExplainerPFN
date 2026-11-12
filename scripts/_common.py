@@ -61,7 +61,7 @@ def resolve_model_path(cli_value: str | os.PathLike | None = None) -> str:
 
     Priority: explicit CLI value, ``$EPFN_MODEL_PATH``, then the most recent
     ``checkpoints*/final_model.ckp`` found in the repository (falling back to
-    ``best_model``). Both layouts are supported: ``checkpoints/v5/...`` used
+    ``best_model``). Both layouts are supported: ``checkpoints/...`` used
     locally and ``checkpoints_v5/...`` used on the cluster.
     """
     if cli_value:

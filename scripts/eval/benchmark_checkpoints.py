@@ -13,7 +13,7 @@ Usage::
 
     python scripts/eval/benchmark_checkpoints.py \
         --results-pkl notebooks/paper_results/pickles/results_across_datasets_mlp.pkl \
-        --models v5=checkpoints/v5/final_model.ckp \
+        --models v5=checkpoints/final_model.ckp \
         --output logs/checkpoint_benchmark.csv
 """
 

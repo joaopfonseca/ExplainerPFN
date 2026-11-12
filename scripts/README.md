@@ -10,7 +10,7 @@ Every script that needs a trained model resolves it in this order:
 1. `--model-path PATH`
 2. `$EPFN_MODEL_PATH`
 3. the newest `checkpoints*/final_model.ckp` in the repository, falling back to
-   `best_model.ckp` (both `checkpoints/v5/...` and `checkpoints_v5/...` layouts
+   `best_model.ckp` (both `checkpoints/...` and `checkpoints_v5/...` layouts
    are recognised)
 
 `epfn` is the reference model used by the paper.
